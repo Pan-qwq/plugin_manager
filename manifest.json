@@ -1,0 +1,23 @@
+{
+    "name": "plugin_manager",
+    "display_name": "插件管理器",
+    "version": "1.0.0",
+    "description": "插件管理插件，提供查询、更新、备份、恢复、切换版本/分支、热加载、自动更新等功能",
+    "author": "MoFox Team",
+    "license": "GPL-3.0",
+    "categories": ["tool"],
+    "tags": ["plugin-manager", "management", "auto-update", "backup", "hot-reload"],
+    "dependencies": {
+        "plugins": [],
+        "components": []
+    },
+    "include": [
+        {
+            "component_type": "command",
+            "component_name": "pm",
+            "dependencies": []
+        }
+    ],
+    "entry_point": "plugin.py",
+    "min_core_version": "1.0.0"
+}

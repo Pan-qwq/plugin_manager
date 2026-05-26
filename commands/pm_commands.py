@@ -1020,29 +1020,44 @@ class PMCommand(BaseCommand):
                 name = item.name
                 if name.startswith("_") or name.startswith("."):
                     continue
-                if name in loaded_set:
+                if name.endswith(("_old", "_bak")):
+                    continue
+                # 读 manifest.json 获取真实插件名
+                manifest_path = item / "manifest.json"
+                if not manifest_path.exists():
+                    continue
+                try:
+                    import json
+                    with open(manifest_path, "r", encoding="utf-8") as mf:
+                        manifest_data = json.load(mf)
+                    manifest_name = manifest_data.get("name", "")
+                    if not manifest_name:
+                        continue
+                except Exception:
+                    continue
+                if manifest_name in loaded_set:
                     continue
                 # 尝试加载
                 try:
                     ok = await plugin_api.load_plugin(str(item))
                     if ok:
                         new_plugins += 1
-                        newly_loaded.append(name)
+                        newly_loaded.append(manifest_name)
                     else:
                         # 获取失败原因
                         reason = ""
                         try:
                             unloaded = await plugin_api.list_unloaded_plugins()
-                            if name in unloaded:
-                                reason = unloaded[name].get("reason", "")
+                            if manifest_name in unloaded:
+                                reason = unloaded[manifest_name].get("reason", "")
                         except Exception:
                             pass
-                        msg = f"⚠️ 加载 {name} 失败"
+                        msg = f"⚠️ 加载 {manifest_name} 失败"
                         if reason:
                             msg += f"（{reason}）"
                         await self._reply(msg)
                 except Exception as e:
-                    await self._reply(f"⚠️ 加载 {name} 异常: {e}")
+                    await self._reply(f"⚠️ 加载 {manifest_name} 异常: {e}")
         # 合并已加载和新加载的
         loaded = sorted(loaded_set | set(newly_loaded))
         if not loaded:

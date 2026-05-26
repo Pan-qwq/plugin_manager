@@ -72,8 +72,58 @@ class PMCommand(BaseCommand):
         """向当前流发送回复。"""
         await send_text(text, stream_id=self.stream_id)
 
+    async def _send_notification(self, text: str) -> None:
+        """根据 notification 配置发送通知消息。
+
+        优先级：
+          1. 若 private_chat_ids 非空 → 发私聊（prefer_private=True 时优先）
+          2. 若 group_chat_ids 非空 → 发群聊（prefer_private=False 时优先）
+          3. 若两者均为空 → 回退到 _reply（当前对话）
+        """
+        try:
+            cfg = self._get_config()
+            if cfg and hasattr(cfg, "notification"):
+                notif = cfg.notification
+                private_ids_str = getattr(notif, "private_chat_ids", "") or ""
+                group_ids_str = getattr(notif, "group_chat_ids", "") or ""
+                prefer_private = getattr(notif, "prefer_private", True)
+
+                private_ids = [
+                    x.strip() for x in private_ids_str.split(",") if x.strip()
+                ]
+                group_ids = [
+                    x.strip() for x in group_ids_str.split(",") if x.strip()
+                ]
+
+                # 决定发送顺序
+                if prefer_private:
+                    targets = private_ids + group_ids  # 先私聊后群聊
+                else:
+                    targets = group_ids + private_ids  # 先群聊后私聊
+
+                if targets:
+                    for tid in targets:
+                        if tid in group_ids:
+                            stream = f"qq_group_{tid}"
+                        else:
+                            stream = f"qq_{tid}"
+                        await send_text(text, stream_id=stream)
+                    return
+        except Exception:
+            pass
+
+        # 回退：发到当前对话
+        await self._reply(text)
+
     async def _ensure_admin(self) -> bool:
-        """检查当前用户是否为 ADMIN 及以上。返回 False 时已自动发送拒绝消息。"""
+        """检查当前用户是否有权限执行操作。
+
+        权限判定顺序（按优先级）：
+          1. 若 permission.allow_all_users = True → 全部放行
+          2. 检查用户平台级别权限：OWNER（bot主人）及以上 → 放行
+          3. 若用户为 QQ 平台且 sender_id 在 permission.admin_qq_ids 中 → 放行
+          4. 其余驳回
+        """
         if self._message is None:
             await self._reply("❌ 无法获取消息来源")
             return False
@@ -82,6 +132,32 @@ class PMCommand(BaseCommand):
         if not platform or not sender_id:
             await self._reply("❌ 无法识别用户身份")
             return False
+
+        # 读取本插件权限配置
+        try:
+            cfg = self._get_config()
+            if cfg and hasattr(cfg, "permission"):
+                perm = cfg.permission
+                # 1. allow_all_users 开关
+                if getattr(perm, "allow_all_users", False):
+                    return True
+                # 2. 检查是否为 bot 主人（平台级 OWNER 及以上）
+                pid = generate_person_id(platform, sender_id)
+                level = await get_user_permission_level(pid)
+                if level.value >= PermissionLevel.OWNER.value:
+                    return True
+                # 3. 检查是否在 admin_qq_ids 中（仅 QQ 平台）
+                if platform == "qq":
+                    admin_ids_str = getattr(perm, "admin_qq_ids", "") or ""
+                    admin_ids = [x.strip() for x in admin_ids_str.split(",") if x.strip()]
+                    if sender_id in admin_ids:
+                        return True
+                await self._reply("❌ 权限不足：此操作需要 bot 主人或管理员权限")
+                return False
+        except Exception:
+            pass
+
+        # 降级：原版逻辑（ADMIN/OPERATOR 级别）
         pid = generate_person_id(platform, sender_id)
         level = await get_user_permission_level(pid)
         if level.value < PermissionLevel.OPERATOR.value:
@@ -788,16 +864,16 @@ class PMCommand(BaseCommand):
 
     async def _do_notify_update(self, name: str, old_ver: str, new_ver: str, config: Any) -> None:
         """通知式自动更新——先通知，再更新，完成后通知。"""
-        await self._reply(f"🔄 {name} 检测到更新 {old_ver} → {new_ver}，正在自动更新…")
+        await self._send_notification(f"🔄 {name} 检测到更新 {old_ver} → {new_ver}，正在自动更新…")
         source_info = self._get_plugin_source_info(name)
         source = source_info.get("source", "unknown")
         if source == "market":
             success, msg = await self._do_market_update(name, new_ver, config)
             if success:
-                await self._reply(f"✅ {name} 已自动更新到 {new_ver}")
+                await self._send_notification(f"✅ {name} 已自动更新到 {new_ver}")
                 self._update_cached_version(name, new_ver)
             else:
-                await self._reply(f"❌ {name} 自动更新失败: {msg}")
+                await self._send_notification(f"❌ {name} 自动更新失败: {msg}")
             return
         repo_url = self._get_github_repo(name)
         if repo_url:
@@ -807,10 +883,10 @@ class PMCommand(BaseCommand):
                 token = config.github.token if config and hasattr(config, "github") else ""
                 success, msg = await self._do_update(name, owner, repo, new_ver, token)
                 if success:
-                    await self._reply(f"✅ {name} 已自动更新到 {new_ver}")
+                    await self._send_notification(f"✅ {name} 已自动更新到 {new_ver}")
                     self._update_cached_version(name, new_ver)
                 else:
-                    await self._reply(f"❌ {name} 自动更新失败: {msg}")
+                    await self._send_notification(f"❌ {name} 自动更新失败: {msg}")
 
     def _update_cached_version(self, name: str, version: str) -> None:
         """更新缓存的已安装版本号。"""
@@ -833,7 +909,7 @@ class PMCommand(BaseCommand):
         plugins_config[name] = p_info
         settings["plugins"] = plugins_config
         self._save_plugin_settings(settings)
-        await self._reply(
+        await self._send_notification(
             f"📢 {name} 有更新 {old_ver} → {new_ver}\n"
             f"回复 /y 确认更新，或 /pm update {name} 手动更新"
         )
@@ -1939,6 +2015,18 @@ class PMCommand(BaseCommand):
                 "[github]",
                 f"  token = {'***' if cfg.github.token else '(未设置)'}  # GitHub Token，可选，提高 API 限频 (str)",
                 f"  default_update_policy = {cfg.github.default_update_policy}  # GitHub 插件默认更新策略：silent/notify/prompt (str)",
+                "",
+                "# 通知配置",
+                "[notification]",
+                f"  notify_on_update = {cfg.notification.notify_on_update}  # 检测到更新时是否发送通知 (bool)",
+                f"  private_chat_ids = {cfg.notification.private_chat_ids or '(未设置)'}  # 通知目标私聊QQ号，逗号分隔 (str)",
+                f"  group_chat_ids = {cfg.notification.group_chat_ids or '(未设置)'}  # 通知目标群聊QQ号，逗号分隔 (str)",
+                f"  prefer_private = {cfg.notification.prefer_private}  # 私聊通知优先（否则群聊优先）(bool)",
+                "",
+                "# 权限配置",
+                "[permission]",
+                f"  admin_qq_ids = {cfg.permission.admin_qq_ids or '(未设置)'}  # 额外管理员QQ号，逗号分隔 (str)",
+                f"  allow_all_users = {cfg.permission.allow_all_users}  # 允许所有用户使用全部指令 (bool)",
             ]
             await self._reply("\n".join(lines))
             # 单独发送修改用法说明，避免消息过长被截断

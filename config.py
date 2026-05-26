@@ -49,6 +49,34 @@ class PluginManagerConfig(BaseConfig):
             default="silent", description="市场插件默认更新策略：silent/notify/prompt"
         )
 
+    @config_section("notification")
+    class NotificationSection(SectionBase):
+        """通知配置。"""
+        notify_on_update: bool = Field(
+            default=True, description="检测到更新时是否发送通知"
+        )
+        private_chat_ids: str = Field(
+            default="",
+            description="通知目标私聊QQ号，多个用逗号分隔（留空=发到当前对话）",
+        )
+        group_chat_ids: str = Field(
+            default="", description="通知目标群聊QQ号，多个用逗号分隔"
+        )
+        prefer_private: bool = Field(
+            default=True, description="私聊通知优先（否则群聊优先）"
+        )
+
+    @config_section("permission")
+    class PermissionSection(SectionBase):
+        """权限配置。"""
+        admin_qq_ids: str = Field(
+            default="",
+            description="额外管理员QQ号，多个用逗号分隔（默认仅bot主人可操作）",
+        )
+        allow_all_users: bool = Field(
+            default=False, description="允许所有用户使用全部指令（覆盖以上设置）"
+        )
+
     @config_section("github")
     class GitHubSection(SectionBase):
         """GitHub 配置。"""
@@ -69,5 +97,7 @@ class PluginManagerConfig(BaseConfig):
     backup: BackupSection = Field(default_factory=BackupSection)
     auto_update: AutoUpdateSection = Field(default_factory=AutoUpdateSection)
     market: MarketSection = Field(default_factory=MarketSection)
+    notification: NotificationSection = Field(default_factory=NotificationSection)
+    permission: PermissionSection = Field(default_factory=PermissionSection)
     github: GitHubSection = Field(default_factory=GitHubSection)
     proxy: ProxySection = Field(default_factory=ProxySection)

@@ -2,7 +2,7 @@
 
 命令列表：
   /pm list                        — 列出所有已加载插件
-  /pm check [插件名]               — 检查 GitHub + 市场版本与新订阅
+  /pm check [插件名]               — 检查 GitHub 远程版本
   /pm update <插件名>              — 更新指定插件（更新前自动备份）
   /pm update --all                 — 批量更新所有有更新的插件
   /pm backup <插件名>              — 手动备份插件
@@ -31,8 +31,6 @@ from pathlib import Path
 from typing import Any
 from urllib.request import Request, urlopen
 from urllib.error import HTTPError, URLError
-
-import httpx
 
 from src.app.plugin_system.api import plugin_api
 from src.app.plugin_system.api.log_api import get_logger
@@ -331,27 +329,7 @@ class PMCommand(BaseCommand):
             source = "github"
         else:
             source = "unknown"
-
-        # 根据来源确定默认配置
-        auto_update = False
-        update_policy = "silent"
-        if source == "market":
-            # 市场插件：auto_update 跟随 core.toml 的 auto_update_mfp
-            core_cfg = self._get_core_config()
-            if core_cfg and hasattr(core_cfg, "plugin_market"):
-                auto_update = getattr(core_cfg.plugin_market, "auto_update_mfp", False)
-            # update_policy 从本插件配置读取
-            pm_cfg = self._get_config()
-            if pm_cfg and hasattr(pm_cfg, "market"):
-                update_policy = getattr(pm_cfg.market, "default_update_policy", "silent")
-        elif source == "github":
-            # GitHub 插件：默认开启 auto_update，策略从配置读取
-            auto_update = True
-            pm_cfg = self._get_config()
-            if pm_cfg and hasattr(pm_cfg, "github"):
-                update_policy = getattr(pm_cfg.github, "default_update_policy", "notify")
-
-        return {"source": source, "auto_update": auto_update, "update_policy": update_policy}
+        return {"source": source, "auto_update": False, "update_policy": "silent"}
 
     def _set_plugin_source_info(self, plugin_name: str, info: dict[str, Any]) -> None:
         """设置插件的来源和策略配置。"""
@@ -418,30 +396,6 @@ class PMCommand(BaseCommand):
             return plugin.config
         return None
 
-    @staticmethod
-    def _get_core_config() -> Any:
-        """获取框架核心配置（含 plugin_market 节）。"""
-        try:
-            from src.core.config import get_core_config
-            return get_core_config()
-        except Exception:
-            return None
-
-    @staticmethod
-    def _get_core_plugins_dir() -> str:
-        """获取插件目录路径。"""
-        try:
-            cfg = PMCommand._get_core_config()
-            if cfg:
-                return cfg.bot.plugins_dir
-        except Exception:
-            pass
-        # 降级：从本插件路径推断
-        path = plugin_api.get_plugin_path("plugin_manager")
-        if path:
-            return str(Path(path).parent)
-        return "plugins"
-
     async def _auto_update_loop(self) -> None:
         """自动更新循环（后台任务）。"""
         while True:
@@ -483,10 +437,8 @@ class PMCommand(BaseCommand):
             except Exception as e:
                 logger.error(f"检测 {name} 异常: {e}")
 
-    async def _refresh_market_cache(self, force: bool = False, config: Any = None) -> dict[str, Any]:
-        """刷新市场订阅缓存。过期或强制时发起 API 调用。
-        返回 market_cache dict（含 subscriptions / fetched_at）。
-        """
+    async def _refresh_market_cache(self, force: bool = False, config: Any = None) -> None:
+        """刷新市场订阅缓存。过期或强制时发起 API 调用。"""
         settings = self._load_plugin_settings()
         market_cache = settings.get("market_cache", {})
         fetched_at = market_cache.get("fetched_at", 0)
@@ -495,199 +447,36 @@ class PMCommand(BaseCommand):
             interval = config.market.check_interval_minutes
         now = __import__("time").time()
         if not force and (now - fetched_at) < interval * 60:
-            return market_cache
-
-        # 读取核心配置中的 [plugin_market] 节
-        core_cfg = self._get_core_config()
-        if not core_cfg or not hasattr(core_cfg, "plugin_market"):
-            logger.warning("核心配置无 [plugin_market] 节，跳过市场缓存")
-            fallback = {"subscriptions": [], "fetched_at": now}
-            settings["market_cache"] = fallback
-            self._save_plugin_settings(settings)
-            return fallback
-
-        pm = core_cfg.plugin_market
-        if not getattr(pm, "enabled", False):
-            logger.debug("市场同步未启用，跳过")
-            fallback = {"subscriptions": [], "fetched_at": now}
-            settings["market_cache"] = fallback
-            self._save_plugin_settings(settings)
-            return fallback
-
-        base_url = getattr(pm, "base_url", "").rstrip("/")
-        user_id = getattr(pm, "user_id", "")
-        token = getattr(pm, "access_token", "")
-        timeout = getattr(pm, "timeout", 20.0)
-        if not base_url or not user_id or not token:
-            logger.warning("市场配置不完整（缺 base_url/user_id/access_token）")
-            fallback = {"subscriptions": [], "fetched_at": now}
-            settings["market_cache"] = fallback
-            self._save_plugin_settings(settings)
-            return fallback
-
+            return  # 缓存未过期
+        # 尝试使用官方的 PluginMarketSyncService
         try:
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "User-Agent": "MoFox-PluginManager/1.0",
-                "Accept": "application/json",
-            }
-            async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
-                resp = await client.get(
-                    f"{base_url}/api/v1/machine/authors/{user_id}/subscriptions",
-                    headers=headers,
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                # 兼容多种响应格式
-                items = (
-                    data.get("items")
-                    or data.get("data")
-                    or data.get("subscriptions")
-                    or []
-                )
-                subs = []
-                for item in items:
-                    plugin_id = str(item.get("plugin_id") or item.get("id") or "")
-                    name = str(
-                        item.get("name")
-                        or item.get("plugin_name")
-                        or item.get("title")
-                        or plugin_id
-                    )
-                    latest_version = str(
-                        item.get("version")
-                        or item.get("latest_version")
-                        or item.get("tag_name")
-                        or ""
-                    )
-                    subs.append({
-                        "plugin_id": plugin_id,
-                        "name": name,
-                        "latest_version": latest_version,
-                    })
-                result = {"subscriptions": subs, "fetched_at": now}
-                settings["market_cache"] = result
-                self._save_plugin_settings(settings)
-                logger.info(f"市场订阅缓存已刷新: {len(subs)} 条")
-                # 自动安装缺失的订阅插件
-                await self._auto_install_missing_subs(subs, config)
-                return result
-        except httpx.HTTPStatusError as e:
-            logger.warning(f"市场 API HTTP 错误 [{e.response.status_code}]: {e}")
-        except httpx.RequestError as e:
-            logger.warning(f"市场 API 请求失败: {e}")
+            from src.app.runtime.plugin_market_sync import PluginMarketSyncService
+            from src.core.app import MoFoxApp
+            app = MoFoxApp.get_instance()
+            if app:
+                async with PluginMarketSyncService(app=app) as sync:
+                    result = await sync.sync()
+                    # 更新缓存
+                    subs = []
+                    # 从 result 提取订阅列表（具体字段取决于官方实现）
+                    if hasattr(result, "updated_plugins"):
+                        for p in result.updated_plugins:
+                            subs.append({
+                                "plugin_id": p.plugin_id if hasattr(p, "plugin_id") else str(p),
+                                "latest_version": p.version if hasattr(p, "version") else "",
+                            })
+                    settings["market_cache"] = {
+                        "subscriptions": subs,
+                        "fetched_at": now,
+                    }
+                    self._save_plugin_settings(settings)
+                    logger.info(f"市场订阅缓存已刷新: {len(subs)} 条")
+                    return
         except Exception as e:
-            logger.warning(f"刷新市场缓存异常: {e}")
+            logger.warning(f"市场同步服务不可用: {e}")
         # 降级：标记缓存已刷新（即使失败也避免反复重试）
-        fallback = {"subscriptions": [], "fetched_at": now}
-        settings["market_cache"] = fallback
+        settings["market_cache"] = {"subscriptions": [], "fetched_at": now}
         self._save_plugin_settings(settings)
-        return fallback
-
-    async def _auto_install_missing_subs(
-        self, subs: list[dict[str, str]], config: Any
-    ) -> None:
-        """自动安装已订阅但本地缺失的市场插件。"""
-        core_cfg = self._get_core_config()
-        if not core_cfg or not hasattr(core_cfg, "plugin_market"):
-            return
-        pm = core_cfg.plugin_market
-        if not getattr(pm, "auto_install_subscribed_missing", False):
-            return
-        loaded = set(plugin_api.list_loaded_plugins())
-        installed_count = 0
-        for sub in subs:
-            name = sub.get("name", "") or sub.get("plugin_id", "")
-            if not name:
-                continue
-            if name in loaded:
-                continue
-            # 也检查磁盘上是否有（即使未加载）
-            plugins_dir = Path(self._get_core_plugins_dir())
-            if (plugins_dir / name).exists() or (plugins_dir / f"{name}.mfp").exists():
-                continue
-            logger.info(f"自动安装缺失的订阅插件: {name}")
-            ok = await self._do_market_install(sub)
-            if ok:
-                installed_count += 1
-                loaded.add(name)
-        if installed_count:
-            logger.info(f"自动安装了 {installed_count} 个缺失的订阅插件")
-
-    async def _do_market_install(self, sub: dict[str, str]) -> bool:
-        """从市场下载并安装一个插件。sub 含 plugin_id / name / latest_version。"""
-        plugin_id = sub.get("plugin_id", "")
-        name = sub.get("name", "") or plugin_id
-        version = sub.get("latest_version", "")
-        if not plugin_id:
-            return False
-
-        core_cfg = self._get_core_config()
-        if not core_cfg or not hasattr(core_cfg, "plugin_market"):
-            return False
-        pm = core_cfg.plugin_market
-        base_url = getattr(pm, "base_url", "").rstrip("/")
-        token = getattr(pm, "access_token", "")
-        timeout = getattr(pm, "timeout", 20.0)
-        if not base_url or not token:
-            return False
-
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "MoFox-PluginManager/1.0",
-            "Accept": "application/json",
-        }
-        try:
-            async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
-                # 1. 获取安装信息（含下载地址）
-                install_resp = await client.get(
-                    f"{base_url}/api/v1/plugins/{plugin_id}/install",
-                    headers=headers,
-                )
-                install_resp.raise_for_status()
-                install_data = install_resp.json()
-                version_info = install_data.get("version", install_data)
-                download_url = version_info.get("asset_download_url", "")
-                if not download_url:
-                    logger.warning(f"市场插件 {name} 无下载地址")
-                    return False
-
-                # 2. 下载 .mfp 文件
-                dl_resp = await client.get(download_url, headers=headers)
-                dl_resp.raise_for_status()
-                content = dl_resp.content
-
-            # 3. 保存到插件目录
-            plugins_dir = Path(self._get_core_plugins_dir())
-            plugins_dir.mkdir(parents=True, exist_ok=True)
-            mfp_path = plugins_dir / f"{name}.mfp"
-            mfp_path.write_bytes(content)
-            logger.info(f"市场插件已下载: {mfp_path} ({len(content)} bytes)")
-
-            # 4. 尝试加载
-            try:
-                ok = await plugin_api.load_plugin(str(mfp_path))
-                if ok:
-                    logger.info(f"市场插件 {name} 已加载")
-                    # 自动注册 auto_update
-                    source_info = self._get_plugin_source_info(name)
-                    if not source_info.get("auto_update", False):
-                        source_info["auto_update"] = True
-                        source_info["source"] = "market"
-                        source_info["update_policy"] = (
-                            source_info.get("update_policy", "silent")
-                        )
-                        self._set_plugin_source_info(name, source_info)
-                    return True
-                else:
-                    logger.warning(f"市场插件 {name} 下载但加载失败")
-                    return False
-            except Exception as e:
-                logger.error(f"市场插件 {name} 加载异常: {e}")
-                return False
-        except Exception as e:
-            logger.warning(f"市场安装 {name} 失败: {e}")
-            return False
 
     async def _check_single_plugin(self, name: str, source: str, update_policy: str,
                                     force: bool = False, config: Any = None) -> None:
@@ -767,14 +556,6 @@ class PMCommand(BaseCommand):
 
     async def _do_silent_update(self, name: str, version: str, config: Any) -> None:
         """静默自动更新——不通知用户。"""
-        source_info = self._get_plugin_source_info(name)
-        source = source_info.get("source", "unknown")
-        if source == "market":
-            success, msg = await self._do_market_update(name, version, config)
-            if success:
-                logger.info(f"静默更新 {name} → {version} 成功")
-                self._update_cached_version(name, version)
-            return
         repo_url = self._get_github_repo(name)
         if repo_url:
             parsed = self._parse_github_repo(repo_url)
@@ -784,21 +565,17 @@ class PMCommand(BaseCommand):
                 success, msg = await self._do_update(name, owner, repo, version, token)
                 if success:
                     logger.info(f"静默更新 {name} → {version} 成功")
-                    self._update_cached_version(name, version)
+                    # 更新 installed_version 缓存
+                    settings = self._load_plugin_settings()
+                    plugins_config = settings.get("plugins", {})
+                    if name in plugins_config:
+                        plugins_config[name]["installed_version"] = version
+                        settings["plugins"] = plugins_config
+                        self._save_plugin_settings(settings)
 
     async def _do_notify_update(self, name: str, old_ver: str, new_ver: str, config: Any) -> None:
         """通知式自动更新——先通知，再更新，完成后通知。"""
         await self._reply(f"🔄 {name} 检测到更新 {old_ver} → {new_ver}，正在自动更新…")
-        source_info = self._get_plugin_source_info(name)
-        source = source_info.get("source", "unknown")
-        if source == "market":
-            success, msg = await self._do_market_update(name, new_ver, config)
-            if success:
-                await self._reply(f"✅ {name} 已自动更新到 {new_ver}")
-                self._update_cached_version(name, new_ver)
-            else:
-                await self._reply(f"❌ {name} 自动更新失败: {msg}")
-            return
         repo_url = self._get_github_repo(name)
         if repo_url:
             parsed = self._parse_github_repo(repo_url)
@@ -808,18 +585,14 @@ class PMCommand(BaseCommand):
                 success, msg = await self._do_update(name, owner, repo, new_ver, token)
                 if success:
                     await self._reply(f"✅ {name} 已自动更新到 {new_ver}")
-                    self._update_cached_version(name, new_ver)
+                    settings = self._load_plugin_settings()
+                    plugins_config = settings.get("plugins", {})
+                    if name in plugins_config:
+                        plugins_config[name]["installed_version"] = new_ver
+                        settings["plugins"] = plugins_config
+                        self._save_plugin_settings(settings)
                 else:
                     await self._reply(f"❌ {name} 自动更新失败: {msg}")
-
-    def _update_cached_version(self, name: str, version: str) -> None:
-        """更新缓存的已安装版本号。"""
-        settings = self._load_plugin_settings()
-        plugins_config = settings.get("plugins", {})
-        if name in plugins_config:
-            plugins_config[name]["installed_version"] = version
-            settings["plugins"] = plugins_config
-            self._save_plugin_settings(settings)
 
     async def _do_prompt_update(self, name: str, old_ver: str, new_ver: str, config: Any) -> None:
         """提示式更新——通知用户，回 /y 才更新。"""
@@ -837,79 +610,6 @@ class PMCommand(BaseCommand):
             f"📢 {name} 有更新 {old_ver} → {new_ver}\n"
             f"回复 /y 确认更新，或 /pm update {name} 手动更新"
         )
-
-    async def _do_market_update(self, name: str, version: str, config: Any) -> tuple[bool, str]:
-        """从市场更新指定的 .mfp 插件。返回 (success, message)。"""
-        # 1. 自动备份
-        backup_path = await self._create_backup(name)
-        if backup_path:
-            logger.info(f"更新前已备份: {backup_path}")
-        # 2. 从 market_cache 查找 plugin_id
-        settings = self._load_plugin_settings()
-        market_cache = settings.get("market_cache", {})
-        subs = market_cache.get("subscriptions", [])
-        plugin_id = ""
-        for sub in subs:
-            if sub.get("name") == name or sub.get("plugin_id") == name:
-                plugin_id = sub.get("plugin_id", "")
-                break
-        if not plugin_id:
-            plugin_id = name
-        # 3. 获取核心配置
-        core_cfg = self._get_core_config()
-        if not core_cfg or not hasattr(core_cfg, "plugin_market"):
-            return False, "核心配置无 [plugin_market] 节"
-        pm = core_cfg.plugin_market
-        base_url = getattr(pm, "base_url", "").rstrip("/")
-        token = getattr(pm, "access_token", "")
-        timeout = getattr(pm, "timeout", 20.0)
-        if not base_url or not token:
-            return False, "市场配置不完整"
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "User-Agent": "MoFox-PluginManager/1.0",
-            "Accept": "application/json",
-        }
-        try:
-            async with httpx.AsyncClient(verify=False, timeout=timeout) as client:
-                # 获取安装信息
-                install_resp = await client.get(
-                    f"{base_url}/api/v1/plugins/{plugin_id}/install",
-                    headers=headers,
-                )
-                install_resp.raise_for_status()
-                install_data = install_resp.json()
-                version_info = install_data.get("version", install_data)
-                download_url = version_info.get("asset_download_url", "")
-                if not download_url:
-                    return False, f"{name}: 市场无下载地址"
-                # 下载 .mfp
-                dl_resp = await client.get(download_url, headers=headers)
-                dl_resp.raise_for_status()
-                content = dl_resp.content
-            # 4. 覆盖到插件路径
-            path = plugin_api.get_plugin_path(name)
-            if not path:
-                return False, f"{name}: 无法获取插件路径"
-            dest = Path(path)
-            if dest.is_file():
-                dest.write_bytes(content)
-            else:
-                mfp_path = dest.parent / f"{name}.mfp"
-                mfp_path.write_bytes(content)
-            logger.info(f"市场插件 {name} 已下载更新 ({len(content)} bytes)")
-        except Exception as e:
-            logger.error(f"市场更新下载失败 {name}: {e}")
-            return False, f"{name}: 市场下载失败 - {e}"
-        # 5. 重载插件
-        try:
-            success = await plugin_api.reload_plugin(name)
-            if success:
-                return True, f"✅ {name} 已更新到 {version}（已热加载）"
-            else:
-                return False, f"⚠️ {name} 已下载到 {version}，但热加载失败，请手动重启 MoFox"
-        except Exception as e:
-            return False, f"⚠️ {name} 已下载到 {version}，但热加载异常: {e}"
 
     async def _do_update(
         self,
@@ -994,9 +694,9 @@ class PMCommand(BaseCommand):
             "📦 插件管理器\n"
             "━━━━━━━━━━━━━━━━\n"
             "• /pm list — 列出已加载插件\n"
-            "• /pm check [插件] — 检查 GitHub 版本 + 市场版本 + 新订阅\n"
-            "• /pm update <插件> — 更新 GitHub / 市场插件\n"
-            "• /pm update --all — 批量更新（含市场）\n"
+            "• /pm check [插件] — 检查 GitHub 版本\n"
+            "• /pm update <插件> — 更新插件\n"
+            "• /pm update --all — 批量更新\n"
             "• /pm backup <插件> — 手动备份\n"
             "• /pm backup list <插件> — 查看备份列表\n"
             "• /pm restore <插件> [编号] — 恢复备份\n"
@@ -1066,20 +766,15 @@ class PMCommand(BaseCommand):
             return True, "no plugins"
         await self._reply(f"🔍 正在检查 {len(plugins_to_check)} 个插件的版本，请稍候…")
 
-        config = self._get_config()
         token = ""
-        if config and hasattr(config, "github"):
-            token = config.github.token
+        plugin = plugin_api.get_plugin("plugin_manager")
+        if plugin and hasattr(plugin, "config"):
+            token = plugin.config.github.token
 
-        # ── 第一阶段：收集 GitHub / 市场信息 ──
+        # 第一阶段：收集信息（无网络请求）
         no_repo: list[str] = []
-        market_plugins: list[str] = []
         to_check: list[tuple[str, str, str]] = []  # (name, owner, repo)
         for name in plugins_to_check:
-            source_info = self._get_plugin_source_info(name)
-            if source_info.get("source") == "market":
-                market_plugins.append(name)
-                continue
             repo_url = self._get_github_repo(name)
             if not repo_url:
                 no_repo.append(name)
@@ -1091,14 +786,16 @@ class PMCommand(BaseCommand):
             owner, repo = parsed
             to_check.append((name, owner, repo))
 
-        # ── 第二阶段：并行检查所有 GitHub 插件 ──
+        # 第二阶段：并行检查所有 GitHub 插件
         async def _check_one(name: str, owner: str, repo: str) -> str:
+            """检查单个 GitHub 插件的远程版本。"""
             try:
                 latest_data = await asyncio.wait_for(
                     self._async_github_request(owner, repo, "releases/latest", token),
                     timeout=8,
                 )
                 if latest_data is None:
+                    # releases/latest 不存在（404），尝试 tags
                     tags = await asyncio.wait_for(
                         self._async_github_request(owner, repo, "tags", token),
                         timeout=8,
@@ -1127,70 +824,19 @@ class PMCommand(BaseCommand):
             return_exceptions=True,
         )
 
-        # ── 第三阶段：刷新市场缓存并检查市场订阅 ──
-        market_cache = await self._refresh_market_cache(force=True, config=config)
-        subs = market_cache.get("subscriptions", [])
+        # 组装结果
+        results = [f"⏭️ {name}: 无 GitHub 仓库信息" for name in no_repo]
+        for r in check_results:
+            results.append(str(r) if isinstance(r, Exception) else r)
 
-        # ── 组装结果 ──
-        lines = []
-        # GitHub 插件结果
-        if to_check:
-            lines.append("📦 GitHub 插件:")
-            for r in check_results:
-                lines.append(str(r) if isinstance(r, Exception) else r)
-        # 无仓库信息的插件
-        if no_repo:
-            lines.append("")
-            lines.append("⛔ 无仓库/市场信息:")
-            for name in no_repo:
-                lines.append(f"  • {name}")
-        # 市场插件版本对比
-        if market_plugins:
-            lines.append("")
-            lines.append("🏪 市场插件:")
-            for name in market_plugins:
-                local_ver = self._get_manifest_field(name, "version")
-                remote_ver = ""
-                for sub in subs:
-                    if sub.get("name") == name or sub.get("plugin_id") == name:
-                        remote_ver = sub.get("latest_version", "")
-                        break
-                if remote_ver and local_ver:
-                    if local_ver == remote_ver:
-                        lines.append(f"  ✅ {name}: 已是最新 ({local_ver})")
-                    else:
-                        lines.append(f"  🔄 {name}: {local_ver} → {remote_ver}")
-                elif remote_ver:
-                    lines.append(f"  📋 {name}: 本地={local_ver or '?'} 远程={remote_ver}")
-                else:
-                    lines.append(f"  📋 {name}: v{local_ver or '?'}（未在订阅列表中找到）")
-        # 新订阅（已订阅但本地未安装的插件）
-        if subs:
-            loaded = set(plugin_api.list_loaded_plugins())
-            new_subs = []
-            for sub in subs:
-                name = sub.get("name", "") or sub.get("plugin_id", "")
-                if name and name not in loaded:
-                    new_subs.append(sub)
-            if new_subs:
-                lines.append("")
-                lines.append(f"🆕 新订阅（未安装）:")
-                for sub in new_subs:
-                    n = sub.get("name", "") or sub.get("plugin_id", "")
-                    v = sub.get("latest_version", "")
-                    lines.append(f"  • {n} (v{v})")
-
-        if not lines:
-            lines.append("✅ 所有插件已是最新")
-
-        await self._reply("\n".join(lines))
+        await self._reply("\n".join(results))
         return True, "check completed"
 
     # ── update ──────────────────────────────────────────────
 
     @cmd_route("update")
     async def handle_update(self, *args: str) -> tuple[bool, str]:
-        """更新插件。支持 GitHub 和市场插件。"""
+        """更新插件。"""
         if not await self._ensure_admin():
             return False, "permission denied"
         if not args:
@@ -1204,29 +850,6 @@ class PMCommand(BaseCommand):
         if not path:
             await self._reply(f"❌ 插件 {plugin_name} 不存在或未加载")
             return False, "plugin not found"
-
-        config = self._get_config()
-        source_info = self._get_plugin_source_info(plugin_name)
-        source = source_info.get("source", "unknown")
-
-        if source == "market":
-            # 市场插件更新
-            await self._reply(f"🔄 正在检查 {plugin_name} 的市场更新…")
-            market_cache = await self._refresh_market_cache(force=True, config=config)
-            subs = market_cache.get("subscriptions", [])
-            version = ""
-            for sub in subs:
-                if sub.get("name") == plugin_name or sub.get("plugin_id") == plugin_name:
-                    version = sub.get("latest_version", "")
-                    break
-            if not version:
-                await self._reply(f"❌ 无法获取 {plugin_name} 的市场版本")
-                return False, "no market version"
-            success, msg = await self._do_market_update(plugin_name, version, config)
-            await self._reply(msg)
-            return success, msg
-
-        # GitHub 插件更新
         repo_url = self._get_github_repo(plugin_name)
         if not repo_url:
             await self._reply(f"❌ {plugin_name} 无 GitHub 仓库信息，无法更新")
@@ -1237,8 +860,9 @@ class PMCommand(BaseCommand):
             return False, "parse failed"
         owner, repo = parsed
         token = ""
-        if config and hasattr(config, "github"):
-            token = config.github.token
+        plugin = plugin_api.get_plugin("plugin_manager")
+        if plugin and hasattr(plugin, "config"):
+            token = plugin.config.github.token
         await self._reply(f"🔄 正在更新 {plugin_name}…")
         # 获取最新版本
         latest = await self._async_github_request(owner, repo, "releases/latest", token)
@@ -1259,38 +883,14 @@ class PMCommand(BaseCommand):
         return success, msg
 
     async def _handle_update_all(self) -> tuple[bool, str]:
-        """批量更新所有有更新的插件（含 GitHub 和市场）。"""
+        """批量更新所有有更新的插件。"""
         loaded = sorted(plugin_api.list_loaded_plugins())
         if not loaded:
             await self._reply("📭 没有已加载的插件")
             return True, "no plugins"
         await self._reply(f"🔄 正在批量检查 {len(loaded)} 个插件的更新…")
-        config = self._get_config()
-        # 刷新市场缓存
-        market_cache = await self._refresh_market_cache(force=True, config=config)
-        subs = market_cache.get("subscriptions", [])
         results = []
         for name in loaded:
-            source_info = self._get_plugin_source_info(name)
-            source = source_info.get("source", "unknown")
-            if source == "market":
-                # 市场插件
-                version = ""
-                for sub in subs:
-                    if sub.get("name") == name or sub.get("plugin_id") == name:
-                        version = sub.get("latest_version", "")
-                        break
-                if not version:
-                    results.append(f"⏭️ {name}: 市场无版本信息")
-                    continue
-                local_ver = self._get_manifest_field(name, "version")
-                if local_ver == version:
-                    results.append(f"✅ {name}: 已是最新")
-                    continue
-                success, msg = await self._do_market_update(name, version, config)
-                results.append(msg)
-                continue
-            # GitHub 插件
             repo_url = self._get_github_repo(name)
             if not repo_url:
                 results.append(f"⏭️ {name}: 无仓库信息")
@@ -1300,8 +900,9 @@ class PMCommand(BaseCommand):
                 continue
             owner, repo = parsed
             token = ""
-            if config and hasattr(config, "github"):
-                token = config.github.token
+            plugin = plugin_api.get_plugin("plugin_manager")
+            if plugin and hasattr(plugin, "config"):
+                token = plugin.config.github.token
             latest = await self._async_github_request(
                 owner, repo, "releases/latest", token
             )

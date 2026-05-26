@@ -2,7 +2,15 @@
 
 # plugin_manager — Neo-MoFox 插件管理器
 
-提供完整的插件生命周期管理：查询、安装、更新、备份/恢复、热加载、自动更新。
+提供完整的插件生命周期管理：查询、安装、更新、备份/恢复、切换版本/分支、热加载、自动更新。
+
+## 特性亮点
+
+- **并行检查** — `/pm check` 使用 `asyncio.gather` 并发请求 GitHub API，14 个插件秒级返回
+- **可配置超时** — 支持增大 EventBus 超时，避免长时间下载/更新被框架截断
+- **多源支持** — 支持 GitHub / 市场插件源的版本检查和更新
+- **热加载安全** — `/pm reload` 先加载新插件，再重载已有插件，降低风险
+- **自动备份** — 更新前自动备份，失败可回滚
 
 ## 实现流程
 
@@ -97,19 +105,26 @@ load_plugin() — MoFox 框架热加载
 | `proxy.https` | str | `""` | HTTPS 代理地址，同上优先从配置 → 环境变量 → 默认值 |
 | `auto_update.enabled` | bool | `false` | 自动更新总开关，关闭后所有插件都不会自动检查更新 |
 | `auto_update.check_interval_minutes` | int | `480` | 后台检查更新的间隔（分钟），最小 60 分钟 |
+| `auto_update.passive_check` | bool | `false` | 是否被动触发（消息经过时顺带检测） |
+| `auto_update.passive_cooldown_minutes` | int | `60` | 被动触发冷却时间（分钟） |
+| `auto_update.extend_eventbus_timeout` | bool | `false` | 增大 EventBus 超时到30秒，适合网络慢/长时间命令场景 |
 | `backup.max_backups_per_plugin` | int | `5` | 每个插件最多保留的备份数，超限时自动删除最旧的 |
 | `backup.backup_dir` | str | `"backups"` | 备份目录名（相对于本插件目录） |
 | `github.token` | str | `""` | GitHub 个人访问令牌，可选。用于提高 API 限频（从 60 次/小时 → 5000 次/小时） |
+| `github.default_update_policy` | str | `"notify"` | GitHub 插件默认更新策略：silent/notify/prompt |
+| `market.check_interval_minutes` | int | `480` | 市场订阅缓存有效期（分钟） |
+| `market.default_update_policy` | str | `"silent"` | 市场插件默认更新策略：silent/notify/prompt |
 
 ### 配置方式
 
 ```bash
-/pm settings                              # 查看所有配置
-/pm settings proxy.http=http://127.0.0.1:7890  # 设置代理（用 = 避免空格问题）
-/pm settings auto_update.enabled 开启     # 开启自动更新
-/pm settings check_interval_minutes 120   # 修改检查间隔
-/pm settings backup.max_backups_per_plugin 10  # 修改备份上限
-/pm settings github.token ghp_xxxxx       # 配置 GitHub Token
+/pm settings                                            # 查看所有配置
+/pm settings proxy.http=http://127.0.0.1:7890           # 设置代理（用 = 避免空格问题）
+/pm settings auto_update.enabled 开启                   # 开启自动更新
+/pm settings auto_update.extend_eventbus_timeout 开启  # 增大超时（适合慢网络）
+/pm settings check_interval_minutes 120                 # 修改检查间隔
+/pm settings backup.max_backups_per_plugin 10           # 修改备份上限
+/pm settings github.token ghp_xxxxx                     # 配置 GitHub Token
 ```
 
 ## 命令详解
@@ -117,7 +132,7 @@ load_plugin() — MoFox 框架热加载
 | 命令 | 功能 | 说明 |
 |------|------|------|
 | `/pm list` | 列出插件 | 显示已加载/未加载的插件、版本、描述、自动更新状态 |
-| `/pm check [name]` | 检查更新 | 对比本地与 GitHub 远程版本号 |
+| `/pm check [name]` | 检查更新 | 并行请求 GitHub API 对比版本号，14 个插件约 2 秒返回 |
 | `/pm update <name>` | 更新插件 | git pull + 备份旧版 + 热重载，失败自动恢复 |
 | `/pm update --all` | 批量更新 | 遍历有更新的插件逐一更新 |
 | `/pm backup <name>` | 备份 | 带时间戳的完整目录备份 |
@@ -136,12 +151,13 @@ load_plugin() — MoFox 框架热加载
 plugin_manager/
 ├── __init__.py                  # 包标识
 ├── plugin.py                    # 插件入口，注册 BasePlugin
-├── config.py                    # PluginManagerConfig 定义（6个配置项）
+├── config.py                    # PluginManagerConfig 定义（5 个配置节）
 ├── manifest.json                # 插件清单（含 categories/tags）
+├── README.md
 ├── commands/
 │   ├── __init__.py
-│   └── pm_commands.py           # PMCommand 实现（~1400行，13个子命令）
-└── README.md
+│   └── pm_commands.py           # PMCommand 实现（13个子命令）
+└── backups/                     # 备份目录（自动创建）
 ```
 
 ## 依赖
@@ -153,11 +169,10 @@ plugin_manager/
 ## 构建
 
 ```bash
-# 构建为 ZIP 包
-mpdt plugin build --format zip
-
 # 构建为 .mfp 格式（推荐用于发布）
 mpdt plugin build --format mfp
+# 构建为 ZIP 包
+mpdt plugin build --format zip
 ```
 
 ## 许可证

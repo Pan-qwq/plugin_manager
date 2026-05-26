@@ -25,8 +25,6 @@ import asyncio
 import json
 import os
 import shutil
-import subprocess
-import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -48,15 +46,23 @@ logger = get_logger("plugin_manager.pm_commands")
 
 # ── 自动更新状态追踪 ──────────────────────────────────────────
 _auto_update_task: asyncio.Task | None = None
-_auto_update_plugins: dict[str, bool] = {}  # plugin_name -> enabled
+_auto_update_plugins: dict[str, bool] = {}  # plugin_name -> enabled (legacy)
 _plugin_settings_path: Path | None = None
+_settings_cache: dict[str, Any] | None = None  # 内存缓存，避免反复读文件
+_last_check_time: float = 0.0  # 上次检测时间（用于被动触发冷却）
+_passive_cooldown_until: float = 0.0  # 被动触发冷却到期时间
 
 
 class PMCommand(BaseCommand):
     """插件管理命令。"""
+
     command_name: str = "pm"
     command_description: str = "插件管理：list/check/update/backup/restore/switch/version/reload/autoupdate/settings/install"
     permission_level: PermissionLevel = PermissionLevel.USER
+
+    async def execute(self, message_text: str) -> tuple[bool, str]:
+        """执行 /pm 命令入口。委托给基类 Trie 树路由系统。"""
+        return await super().execute(message_text)
 
     # ── 内部辅助方法 ──────────────────────────────────────────
 
@@ -120,6 +126,7 @@ class PMCommand(BaseCommand):
             if 0 <= idx < len(loaded):
                 return loaded[idx]
         return name_or_index
+
     def _get_github_repo(self, plugin_name: str) -> str:
         """获取插件的 GitHub 仓库地址。
         优先级：manifest.json 中的 repo 字段 > git remote
@@ -134,6 +141,7 @@ class PMCommand(BaseCommand):
             return ""
         try:
             import subprocess
+
             result = subprocess.run(
                 ["git", "-C", path, "remote", "get-url", "origin"],
                 capture_output=True,
@@ -195,7 +203,10 @@ class PMCommand(BaseCommand):
             if e.code == 404:
                 return None
             if e.code == 403:
-                return {"error": "rate_limited", "message": "API 限频，请配置 GitHub Token"}
+                return {
+                    "error": "rate_limited",
+                    "message": "API 限频，请配置 GitHub Token",
+                }
             return {"error": str(e.code)}
         except URLError as e:
             logger.warning(f"GitHub API 连接失败: {e.reason}")
@@ -216,7 +227,11 @@ class PMCommand(BaseCommand):
         return await loop.run_in_executor(
             None,
             self._github_api_request,
-            owner, repo, endpoint, token, proxy,
+            owner,
+            repo,
+            endpoint,
+            token,
+            proxy,
         )
 
     async def _create_backup(self, plugin_name: str) -> str | None:
@@ -266,29 +281,86 @@ class PMCommand(BaseCommand):
     # ── 自动更新相关 ──────────────────────────────────────────
 
     def _load_plugin_settings(self) -> dict[str, Any]:
-        """加载插件设置（每个插件的 auto_update 开关等）。"""
-        global _plugin_settings_path
+        """加载插件设置（含缓存）。"""
+        global _plugin_settings_path, _settings_cache
+        if _settings_cache is not None:
+            return _settings_cache
         settings_path = self._get_plugin_dir() / "plugin_settings.json"
         _plugin_settings_path = settings_path
         if settings_path.exists():
             try:
                 with open(settings_path, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    _settings_cache = json.load(f)
+                return _settings_cache
             except (json.JSONDecodeError, OSError):
                 pass
-        return {}
+        _settings_cache = {}
+        return _settings_cache
 
     def _save_plugin_settings(self, data: dict[str, Any]) -> None:
-        """保存插件设置。"""
-        global _plugin_settings_path
+        """保存插件设置（同时更新缓存）。"""
+        global _plugin_settings_path, _settings_cache
         if _plugin_settings_path is None:
             _plugin_settings_path = self._get_plugin_dir() / "plugin_settings.json"
         try:
             _plugin_settings_path.parent.mkdir(parents=True, exist_ok=True)
             with open(_plugin_settings_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+            _settings_cache = data  # 同步缓存
         except OSError as e:
             logger.error(f"保存插件设置失败: {e}")
+
+    def _get_plugin_source_info(self, plugin_name: str) -> dict[str, Any]:
+        """获取插件的来源和策略配置。从 settings 读取，无配置时自动推断。"""
+        settings = self._load_plugin_settings()
+        plugins_config = settings.get("plugins", {})
+        info = plugins_config.get(plugin_name, {})
+        if info:
+            return info
+        # 自动推断：有 GitHub repo 则为 github，否则为 unknown
+        repo_url = self._get_github_repo(plugin_name)
+        is_mfp = False
+        path = plugin_api.get_plugin_path(plugin_name)
+        if path:
+            is_mfp = Path(path).suffix == ".mfp"
+        if is_mfp:
+            source = "market"
+        elif repo_url:
+            source = "github"
+        else:
+            source = "unknown"
+        return {"source": source, "auto_update": False, "update_policy": "silent"}
+
+    def _set_plugin_source_info(self, plugin_name: str, info: dict[str, Any]) -> None:
+        """设置插件的来源和策略配置。"""
+        settings = self._load_plugin_settings()
+        if "plugins" not in settings:
+            settings["plugins"] = {}
+        settings["plugins"][plugin_name] = info
+        self._save_plugin_settings(settings)
+
+    def _get_plugin_setting(self, plugin_name: str, key: str, default: Any = None) -> Any:
+        """获取插件单项配置。"""
+        info = self._get_plugin_source_info(plugin_name)
+        return info.get(key, default)
+
+    def _set_plugin_setting(self, plugin_name: str, key: str, value: Any) -> None:
+        """设置插件单项配置。"""
+        info = self._get_plugin_source_info(plugin_name)
+        info[key] = value
+        self._set_plugin_source_info(plugin_name, info)
+
+    async def start_auto_update(self) -> None:
+        """公开方法：由 plugin.py on_plugin_loaded 调用，启动后台循环。"""
+        await self._start_auto_update()
+
+    async def stop_auto_update(self) -> None:
+        """公开方法：由 plugin.py on_plugin_unloaded 调用，停止后台循环。"""
+        global _auto_update_task
+        if _auto_update_task is not None and not _auto_update_task.done():
+            _auto_update_task.cancel()
+            _auto_update_task = None
+            logger.info("自动更新后台任务已停止")
 
     async def _start_auto_update(self) -> None:
         """启动自动更新后台任务。"""
@@ -298,70 +370,246 @@ class PMCommand(BaseCommand):
         _auto_update_task = asyncio.create_task(self._auto_update_loop())
         logger.info("自动更新后台任务已启动")
 
+    async def on_message_trigger(self) -> None:
+        """被动触发检测——消息经过时调用。受冷却时间控制。"""
+        global _passive_cooldown_until
+        now = __import__("time").time()
+        if now < _passive_cooldown_until:
+            return  # 冷却中，跳过
+        config = self._get_config()
+        if not config or not config.auto_update.enabled:
+            return
+        if not config.auto_update.passive_check:
+            return
+        # 冷却时间到，执行一次快速检测
+        _passive_cooldown_until = now + config.auto_update.passive_cooldown_minutes * 60
+        logger.debug("被动触发检测开始")
+        try:
+            await self._run_check_cycle(force_cache=False)
+        except Exception as e:
+            logger.error(f"被动检测异常: {e}")
+
+    def _get_config(self) -> Any:
+        """获取 plugin_manager 配置。"""
+        plugin = plugin_api.get_plugin("plugin_manager")
+        if plugin and hasattr(plugin, "config"):
+            return plugin.config
+        return None
+
     async def _auto_update_loop(self) -> None:
-        """自动更新循环。"""
-        global _auto_update_plugins
+        """自动更新循环（后台任务）。"""
         while True:
             try:
-                # 读取配置
-                interval = 480  # 默认 8 小时
-                enabled = False
-                plugin = plugin_api.get_plugin("plugin_manager")
-                if plugin and hasattr(plugin, "config"):
-                    enabled = plugin.config.auto_update.enabled
-                    interval = plugin.config.auto_update.check_interval_minutes
+                config = self._get_config()
+                enabled = config.auto_update.enabled if config else False
+                interval = config.auto_update.check_interval_minutes if config else 480
                 if not enabled:
-                    # 如果总开关关闭，等待较长时间再检查
-                    await asyncio.sleep(600)  # 10 分钟
+                    await asyncio.sleep(600)
                     continue
-                # 加载插件设置
-                settings = self._load_plugin_settings()
-                _auto_update_plugins = settings.get("auto_update", {})
-                # 遍历所有已加载插件
-                loaded = sorted(plugin_api.list_loaded_plugins())
-                for name in loaded:
-                    if _auto_update_plugins.get(name, False):
-                        await self._check_and_update(name)
+                await self._run_check_cycle(force_cache=False)
                 await asyncio.sleep(interval * 60)
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"自动更新循环异常: {e}")
-                await asyncio.sleep(300)  # 5 分钟后重试
+                await asyncio.sleep(300)
 
-    async def _check_and_update(self, plugin_name: str) -> tuple[bool, str]:
-        """检查并更新单个插件。返回 (是否成功, 消息)。"""
-        repo_url = self._get_github_repo(plugin_name)
+    async def _run_check_cycle(self, force_cache: bool = False) -> None:
+        """一次完整的检测循环。遍历所有已加载插件，按来源路由。"""
+        loaded = sorted(plugin_api.list_loaded_plugins())
+        if not loaded:
+            return
+        config = self._get_config()
+        # 1. 检查市场缓存
+        await self._refresh_market_cache(force=force_cache, config=config)
+        # 2. 遍历插件
+        for name in loaded:
+            try:
+                source_info = self._get_plugin_source_info(name)
+                source = source_info.get("source", "unknown")
+                if source == "unknown":
+                    continue
+                update_policy = source_info.get("update_policy", "silent")
+                auto_update = source_info.get("auto_update", False)
+                if not auto_update:
+                    continue
+                await self._check_single_plugin(name, source, update_policy, force=force_cache, config=config)
+            except Exception as e:
+                logger.error(f"检测 {name} 异常: {e}")
+
+    async def _refresh_market_cache(self, force: bool = False, config: Any = None) -> None:
+        """刷新市场订阅缓存。过期或强制时发起 API 调用。"""
+        settings = self._load_plugin_settings()
+        market_cache = settings.get("market_cache", {})
+        fetched_at = market_cache.get("fetched_at", 0)
+        interval = 480
+        if config and hasattr(config, "market"):
+            interval = config.market.check_interval_minutes
+        now = __import__("time").time()
+        if not force and (now - fetched_at) < interval * 60:
+            return  # 缓存未过期
+        # 尝试使用官方的 PluginMarketSyncService
+        try:
+            from src.app.runtime.plugin_market_sync import PluginMarketSyncService
+            from src.core.app import MoFoxApp
+            app = MoFoxApp.get_instance()
+            if app:
+                async with PluginMarketSyncService(app=app) as sync:
+                    result = await sync.sync()
+                    # 更新缓存
+                    subs = []
+                    # 从 result 提取订阅列表（具体字段取决于官方实现）
+                    if hasattr(result, "updated_plugins"):
+                        for p in result.updated_plugins:
+                            subs.append({
+                                "plugin_id": p.plugin_id if hasattr(p, "plugin_id") else str(p),
+                                "latest_version": p.version if hasattr(p, "version") else "",
+                            })
+                    settings["market_cache"] = {
+                        "subscriptions": subs,
+                        "fetched_at": now,
+                    }
+                    self._save_plugin_settings(settings)
+                    logger.info(f"市场订阅缓存已刷新: {len(subs)} 条")
+                    return
+        except Exception as e:
+            logger.warning(f"市场同步服务不可用: {e}")
+        # 降级：标记缓存已刷新（即使失败也避免反复重试）
+        settings["market_cache"] = {"subscriptions": [], "fetched_at": now}
+        self._save_plugin_settings(settings)
+
+    async def _check_single_plugin(self, name: str, source: str, update_policy: str,
+                                    force: bool = False, config: Any = None) -> None:
+        """检查单个插件是否有更新，并按策略执行。"""
+        now = __import__("time").time()
+        settings = self._load_plugin_settings()
+        plugins_config = settings.get("plugins", {})
+        p_info = plugins_config.get(name, {})
+        last_fetched = p_info.get("latest_version_fetched_at", 0)
+        cached_version = p_info.get("latest_version", "")
+        installed_version = p_info.get("installed_version", "")
+        # 如果未缓存已安装版本，从 manifest 读取
+        if not installed_version:
+            installed_version = self._get_manifest_field(name, "version")
+            p_info["installed_version"] = installed_version
+        # 缓存检查
+        check_interval = 480
+        if source == "market" and config and hasattr(config, "market"):
+            check_interval = config.market.check_interval_minutes
+        elif source == "github" and config and hasattr(config, "github"):
+            check_interval = getattr(config.github, "check_interval_minutes", 480)
+        cache_valid = not force and (now - last_fetched) < check_interval * 60
+        latest_version = cached_version if cache_valid else ""
+        if not cache_valid:
+            # 需要拉远程检查
+            if source == "github":
+                latest_version = await self._check_github_version(name, config)
+            elif source == "market":
+                latest_version = await self._check_market_version(name, config)
+            # 更新缓存
+            p_info["latest_version"] = latest_version or ""
+            p_info["latest_version_fetched_at"] = now
+            plugins_config[name] = p_info
+            settings["plugins"] = plugins_config
+            self._save_plugin_settings(settings)
+        if not latest_version or not installed_version:
+            return
+        if installed_version == latest_version:
+            return  # 已是最新
+        # 有更新 → 按策略执行
+        logger.info(f"{name}: {installed_version} → {latest_version} ({update_policy})")
+        policy = update_policy or "silent"
+        if policy == "silent":
+            await self._do_silent_update(name, latest_version, config)
+        elif policy == "notify":
+            await self._do_notify_update(name, installed_version, latest_version, config)
+        elif policy == "prompt":
+            await self._do_prompt_update(name, installed_version, latest_version, config)
+
+    async def _check_github_version(self, name: str, config: Any) -> str:
+        """检查 GitHub 插件最新版本。返回版本号或空字符串。"""
+        repo_url = self._get_github_repo(name)
         if not repo_url:
-            return False, f"{plugin_name}: 无 GitHub 仓库信息，跳过"
+            return ""
         parsed = self._parse_github_repo(repo_url)
         if not parsed:
-            return False, f"{plugin_name}: 无法解析仓库地址"
+            return ""
         owner, repo = parsed
-        # 获取配置
-        token = ""
-        plugin = plugin_api.get_plugin("plugin_manager")
-        if plugin and hasattr(plugin, "config"):
-            token = plugin.config.github.token
-        # 查询最新版本
+        token = config.github.token if config and hasattr(config, "github") else ""
         latest = await self._async_github_request(owner, repo, "releases/latest", token)
         if latest is None or isinstance(latest, dict) and "error" in latest:
-            # 尝试从 tags 获取
             tags = await self._async_github_request(owner, repo, "tags", token)
             if tags and isinstance(tags, list) and len(tags) > 0:
-                latest_version = tags[0].get("name", "")
-            else:
-                return False, f"{plugin_name}: 无法获取远程版本"
-        else:
-            latest_version = latest.get("tag_name", "")
-        if not latest_version:
-            return False, f"{plugin_name}: 无法解析远程版本号"
-        # 获取本地版本
-        local_version = self._get_manifest_field(plugin_name, "version")
-        if local_version == latest_version:
-            return True, f"{plugin_name}: 已是最新版本 ({local_version})"
-        # 有更新，执行更新
-        return await self._do_update(plugin_name, owner, repo, latest_version, token)
+                return tags[0].get("name", "")
+            return ""
+        return latest.get("tag_name", "")
+
+    async def _check_market_version(self, name: str, config: Any) -> str:
+        """检查市场插件最新版本。从 market_cache 中查找。"""
+        settings = self._load_plugin_settings()
+        market_cache = settings.get("market_cache", {})
+        subs = market_cache.get("subscriptions", [])
+        for sub in subs:
+            if sub.get("plugin_id") == name or sub.get("name") == name:
+                return sub.get("latest_version", "")
+        return ""
+
+    async def _do_silent_update(self, name: str, version: str, config: Any) -> None:
+        """静默自动更新——不通知用户。"""
+        repo_url = self._get_github_repo(name)
+        if repo_url:
+            parsed = self._parse_github_repo(repo_url)
+            if parsed:
+                owner, repo = parsed
+                token = config.github.token if config and hasattr(config, "github") else ""
+                success, msg = await self._do_update(name, owner, repo, version, token)
+                if success:
+                    logger.info(f"静默更新 {name} → {version} 成功")
+                    # 更新 installed_version 缓存
+                    settings = self._load_plugin_settings()
+                    plugins_config = settings.get("plugins", {})
+                    if name in plugins_config:
+                        plugins_config[name]["installed_version"] = version
+                        settings["plugins"] = plugins_config
+                        self._save_plugin_settings(settings)
+
+    async def _do_notify_update(self, name: str, old_ver: str, new_ver: str, config: Any) -> None:
+        """通知式自动更新——先通知，再更新，完成后通知。"""
+        await self._reply(f"🔄 {name} 检测到更新 {old_ver} → {new_ver}，正在自动更新…")
+        repo_url = self._get_github_repo(name)
+        if repo_url:
+            parsed = self._parse_github_repo(repo_url)
+            if parsed:
+                owner, repo = parsed
+                token = config.github.token if config and hasattr(config, "github") else ""
+                success, msg = await self._do_update(name, owner, repo, new_ver, token)
+                if success:
+                    await self._reply(f"✅ {name} 已自动更新到 {new_ver}")
+                    settings = self._load_plugin_settings()
+                    plugins_config = settings.get("plugins", {})
+                    if name in plugins_config:
+                        plugins_config[name]["installed_version"] = new_ver
+                        settings["plugins"] = plugins_config
+                        self._save_plugin_settings(settings)
+                else:
+                    await self._reply(f"❌ {name} 自动更新失败: {msg}")
+
+    async def _do_prompt_update(self, name: str, old_ver: str, new_ver: str, config: Any) -> None:
+        """提示式更新——通知用户，回 /y 才更新。"""
+        settings = self._load_plugin_settings()
+        plugins_config = settings.get("plugins", {})
+        p_info = plugins_config.get(name, {})
+        notified = p_info.get("notified_version", "")
+        if notified == new_ver:
+            return  # 已通知过，等用户回复
+        p_info["notified_version"] = new_ver
+        plugins_config[name] = p_info
+        settings["plugins"] = plugins_config
+        self._save_plugin_settings(settings)
+        await self._reply(
+            f"📢 {name} 有更新 {old_ver} → {new_ver}\n"
+            f"回复 /y 确认更新，或 /pm update {name} 手动更新"
+        )
 
     async def _do_update(
         self,
@@ -393,6 +641,7 @@ class PMCommand(BaseCommand):
             )
             # 解压到临时目录
             import tempfile
+
             with tempfile.TemporaryDirectory() as tmpdir:
                 zip_path = Path(tmpdir) / "download.zip"
                 zip_path.write_bytes(resp_data)
@@ -429,7 +678,10 @@ class PMCommand(BaseCommand):
             if success:
                 return True, f"✅ {plugin_name} 已更新到 {version}（已热加载）"
             else:
-                return False, f"⚠️ {plugin_name} 已下载到 {version}，但热加载失败，请手动重启 MoFox"
+                return (
+                    False,
+                    f"⚠️ {plugin_name} 已下载到 {version}，但热加载失败，请手动重启 MoFox",
+                )
         except Exception as e:
             return False, f"⚠️ {plugin_name} 已下载到 {version}，但热加载异常: {e}"
 
@@ -481,7 +733,9 @@ class PMCommand(BaseCommand):
             has_repo = bool(self._get_github_repo(name))
             no_repo_mark = "" if has_repo else " ⛔不可自动更新"
             auto_mark = " 🔄" if auto_update_map.get(name, False) else ""
-            lines.append(f"[{i}] ✅ {name} v{version}{short_desc}{no_repo_mark}{auto_mark}")
+            lines.append(
+                f"[{i}] ✅ {name} v{version}{short_desc}{no_repo_mark}{auto_mark}"
+            )
         # 检查是否有未加载的插件
         try:
             unloaded = await plugin_api.list_unloaded_plugins()
@@ -502,49 +756,79 @@ class PMCommand(BaseCommand):
 
     @cmd_route("check")
     async def handle_check(self, plugin_name: str = "") -> tuple[bool, str]:
-        """检查插件 GitHub 版本。留空则检查所有。"""
+        """检查插件版本。留空则检查所有。"""
         plugin_name = await self._resolve_plugin_name(plugin_name)
-        plugins_to_check = [plugin_name] if plugin_name else plugin_api.list_loaded_plugins()
+        plugins_to_check = (
+            [plugin_name] if plugin_name else plugin_api.list_loaded_plugins()
+        )
         if not plugins_to_check:
             await self._reply("📭 没有已加载的插件可检查")
             return True, "no plugins"
         await self._reply(f"🔍 正在检查 {len(plugins_to_check)} 个插件的版本，请稍候…")
-        results = []
+
+        token = ""
+        plugin = plugin_api.get_plugin("plugin_manager")
+        if plugin and hasattr(plugin, "config"):
+            token = plugin.config.github.token
+
+        # 第一阶段：收集信息（无网络请求）
+        no_repo: list[str] = []
+        to_check: list[tuple[str, str, str]] = []  # (name, owner, repo)
         for name in plugins_to_check:
             repo_url = self._get_github_repo(name)
             if not repo_url:
-                results.append(f"⏭️ {name}: 无 GitHub 仓库信息")
+                no_repo.append(name)
                 continue
             parsed = self._parse_github_repo(repo_url)
             if not parsed:
-                results.append(f"⏭️ {name}: 无法解析仓库地址")
+                no_repo.append(name)
                 continue
             owner, repo = parsed
-            token = ""
-            plugin = plugin_api.get_plugin("plugin_manager")
-            if plugin and hasattr(plugin, "config"):
-                token = plugin.config.github.token
-            latest_data = await self._async_github_request(owner, repo, "releases/latest", token)
-            if latest_data is None:
-                # 尝试 tags
-                tags = await self._async_github_request(owner, repo, "tags", token)
-                if tags and isinstance(tags, list) and len(tags) > 0:
-                    latest_ver = tags[0].get("name", "?")
+            to_check.append((name, owner, repo))
+
+        # 第二阶段：并行检查所有 GitHub 插件
+        async def _check_one(name: str, owner: str, repo: str) -> str:
+            """检查单个 GitHub 插件的远程版本。"""
+            try:
+                latest_data = await asyncio.wait_for(
+                    self._async_github_request(owner, repo, "releases/latest", token),
+                    timeout=8,
+                )
+                if latest_data is None:
+                    # releases/latest 不存在（404），尝试 tags
+                    tags = await asyncio.wait_for(
+                        self._async_github_request(owner, repo, "tags", token),
+                        timeout=8,
+                    )
+                    if tags and isinstance(tags, list) and len(tags) > 0:
+                        latest_ver = tags[0].get("name", "?")
+                    else:
+                        return f"❓ {name}: 无法获取远程版本 (API 可能不可用)"
+                elif isinstance(latest_data, dict) and "error" in latest_data:
+                    return f"❓ {name}: API 错误 - {latest_data.get('message', 'unknown')}"
                 else:
-                    results.append(f"❓ {name}: 无法获取远程版本 (API 可能不可用)")
-                    continue
-            elif isinstance(latest_data, dict) and "error" in latest_data:
-                results.append(f"❓ {name}: API 错误 - {latest_data.get('message', 'unknown')}")
-                continue
-            else:
-                latest_ver = latest_data.get("tag_name", "?")
-            local_ver = self._get_manifest_field(name, "version")
-            if local_ver == latest_ver:
-                results.append(f"✅ {name}: 已是最新 ({local_ver})")
-            elif local_ver and latest_ver:
-                results.append(f"🔄 {name}: {local_ver} → {latest_ver}")
-            else:
-                results.append(f"📋 {name}: 本地={local_ver or '?'} 远程={latest_ver}")
+                    latest_ver = latest_data.get("tag_name", "?")
+                local_ver = self._get_manifest_field(name, "version")
+                if local_ver == latest_ver:
+                    return f"✅ {name}: 已是最新 ({local_ver})"
+                elif local_ver and latest_ver:
+                    return f"🔄 {name}: {local_ver} → {latest_ver}"
+                return f"📋 {name}: 本地={local_ver or '?'} 远程={latest_ver}"
+            except asyncio.TimeoutError:
+                return f"⏱️ {name}: 检查超时"
+            except Exception as e:
+                return f"❓ {name}: 检查失败 - {e}"
+
+        check_results = await asyncio.gather(
+            *[_check_one(name, owner, repo) for name, owner, repo in to_check],
+            return_exceptions=True,
+        )
+
+        # 组装结果
+        results = [f"⏭️ {name}: 无 GitHub 仓库信息" for name in no_repo]
+        for r in check_results:
+            results.append(str(r) if isinstance(r, Exception) else r)
+
         await self._reply("\n".join(results))
         return True, "check completed"
 
@@ -619,7 +903,9 @@ class PMCommand(BaseCommand):
             plugin = plugin_api.get_plugin("plugin_manager")
             if plugin and hasattr(plugin, "config"):
                 token = plugin.config.github.token
-            latest = await self._async_github_request(owner, repo, "releases/latest", token)
+            latest = await self._async_github_request(
+                owner, repo, "releases/latest", token
+            )
             if latest is None or isinstance(latest, dict) and "error" in latest:
                 tags = await self._async_github_request(owner, repo, "tags", token)
                 if tags and isinstance(tags, list) and len(tags) > 0:
@@ -684,7 +970,11 @@ class PMCommand(BaseCommand):
         lines = [f"📦 {plugin_name} 的备份列表:", "───" * 10]
         for i, bp in enumerate(backups, 1):
             size = bp.stat().st_size
-            size_str = f"{size / 1024:.1f} KB" if size < 1024 * 1024 else f"{size / 1024 / 1024:.1f} MB"
+            size_str = (
+                f"{size / 1024:.1f} KB"
+                if size < 1024 * 1024
+                else f"{size / 1024 / 1024:.1f} MB"
+            )
             mtime = os.path.getmtime(bp)
             lines.append(f"  [{i}] {self._format_timestamp(mtime)} ({size_str})")
         await self._reply("\n".join(lines))
@@ -693,7 +983,9 @@ class PMCommand(BaseCommand):
     # ── restore ─────────────────────────────────────────────
 
     @cmd_route("restore")
-    async def handle_restore(self, plugin_name: str = "", backup_index: str = "") -> tuple[bool, str]:
+    async def handle_restore(
+        self, plugin_name: str = "", backup_index: str = ""
+    ) -> tuple[bool, str]:
         """恢复插件备份。"""
         plugin_name = await self._resolve_plugin_name(plugin_name)
         if not await self._ensure_admin():
@@ -743,9 +1035,13 @@ class PMCommand(BaseCommand):
             # 重载
             success = await plugin_api.reload_plugin(plugin_name)
             if success:
-                await self._reply(f"✅ {plugin_name} 已从备份 #{index} 恢复（已热加载）")
+                await self._reply(
+                    f"✅ {plugin_name} 已从备份 #{index} 恢复（已热加载）"
+                )
             else:
-                await self._reply(f"⚠️ {plugin_name} 已恢复，但热加载失败，请手动重启 MoFox")
+                await self._reply(
+                    f"⚠️ {plugin_name} 已恢复，但热加载失败，请手动重启 MoFox"
+                )
             return True, f"restored from backup #{index}"
         except Exception as e:
             logger.error(f"恢复备份失败 {plugin_name}: {e}")
@@ -773,7 +1069,7 @@ class PMCommand(BaseCommand):
             return False, "no repo"
         parsed = self._parse_github_repo(repo_url)
         if not parsed:
-            await self._reply(f"❌ 无法解析仓库地址")
+            await self._reply("❌ 无法解析仓库地址")
             return False, "parse failed"
         owner, repo = parsed
         token = ""
@@ -794,7 +1090,9 @@ class PMCommand(BaseCommand):
         return True, f"listed {len(branches)} branches"
 
     @cmd_route("switch_branch")
-    async def handle_switch_branch(self, plugin_name: str = "", branch_index: str = "") -> tuple[bool, str]:
+    async def handle_switch_branch(
+        self, plugin_name: str = "", branch_index: str = ""
+    ) -> tuple[bool, str]:
         """切换到指定分支。内部命令，由 /pm switch 后调用。"""
         plugin_name = await self._resolve_plugin_name(plugin_name)
         if not await self._ensure_admin():
@@ -808,11 +1106,11 @@ class PMCommand(BaseCommand):
             return False, "not found"
         repo_url = self._get_github_repo(plugin_name)
         if not repo_url:
-            await self._reply(f"❌ 无仓库信息")
+            await self._reply("❌ 无仓库信息")
             return False, "no repo"
         parsed = self._parse_github_repo(repo_url)
         if not parsed:
-            await self._reply(f"❌ 无法解析仓库地址")
+            await self._reply("❌ 无法解析仓库地址")
             return False, "parse failed"
         owner, repo = parsed
         token = ""
@@ -821,7 +1119,7 @@ class PMCommand(BaseCommand):
             token = plugin.config.github.token
         branches = await self._async_github_request(owner, repo, "branches", token)
         if not branches or not isinstance(branches, list):
-            await self._reply(f"❌ 无法获取分支列表")
+            await self._reply("❌ 无法获取分支列表")
             return False, "no branches"
         try:
             idx = int(branch_index) - 1
@@ -830,7 +1128,7 @@ class PMCommand(BaseCommand):
                 return False, "invalid index"
             branch_name = branches[idx].get("name", "")
         except (ValueError, IndexError):
-            await self._reply(f"❌ 编号无效")
+            await self._reply("❌ 编号无效")
             return False, "invalid index"
         if not branch_name:
             await self._reply("❌ 无法获取分支名")
@@ -838,19 +1136,24 @@ class PMCommand(BaseCommand):
         # 自动备份
         await self._create_backup(plugin_name)
         # 尝试用 git 切换
-        dest = Path(path)
-        git_dir = dest / ".git"
         try:
             import subprocess
-            subprocess.run(["git", "-C", path, "fetch", "--all"], capture_output=True, timeout=15)
+
+            subprocess.run(
+                ["git", "-C", path, "fetch", "--all"], capture_output=True, timeout=15
+            )
             result = subprocess.run(
                 ["git", "-C", path, "checkout", branch_name],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             if result.returncode != 0:
                 # git 方式失败，尝试下载
-                await self._reply(f"⚠️ git checkout 失败，尝试下载分支内容…")
-                success, msg = await self._do_update(plugin_name, owner, repo, branch_name, token)
+                await self._reply("⚠️ git checkout 失败，尝试下载分支内容…")
+                success, msg = await self._do_update(
+                    plugin_name, owner, repo, branch_name, token
+                )
                 await self._reply(msg)
                 return success, msg
             # 重载
@@ -883,7 +1186,7 @@ class PMCommand(BaseCommand):
             return False, "no repo"
         parsed = self._parse_github_repo(repo_url)
         if not parsed:
-            await self._reply(f"❌ 无法解析仓库地址")
+            await self._reply("❌ 无法解析仓库地址")
             return False, "parse failed"
         owner, repo = parsed
         token = ""
@@ -917,7 +1220,9 @@ class PMCommand(BaseCommand):
         return True, f"listed {len(tags)} tags"
 
     @cmd_route("switch_version")
-    async def handle_switch_version(self, plugin_name: str = "", version_index: str = "") -> tuple[bool, str]:
+    async def handle_switch_version(
+        self, plugin_name: str = "", version_index: str = ""
+    ) -> tuple[bool, str]:
         """切换到指定版本。内部命令，由 /pm version 后调用。"""
         plugin_name = await self._resolve_plugin_name(plugin_name)
         if not await self._ensure_admin():
@@ -931,11 +1236,11 @@ class PMCommand(BaseCommand):
             return False, "not found"
         repo_url = self._get_github_repo(plugin_name)
         if not repo_url:
-            await self._reply(f"❌ 无仓库信息")
+            await self._reply("❌ 无仓库信息")
             return False, "no repo"
         parsed = self._parse_github_repo(repo_url)
         if not parsed:
-            await self._reply(f"❌ 无法解析仓库地址")
+            await self._reply("❌ 无法解析仓库地址")
             return False, "parse failed"
         owner, repo = parsed
         token = ""
@@ -967,9 +1272,12 @@ class PMCommand(BaseCommand):
         # 尝试用 git 切换
         try:
             import subprocess
+
             result = subprocess.run(
                 ["git", "-C", path, "checkout", "tags/" + tag_name],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             if result.returncode == 0:
                 success = await plugin_api.reload_plugin(plugin_name)
@@ -979,7 +1287,7 @@ class PMCommand(BaseCommand):
         except Exception:
             pass
         # git 方式失败，下载版本
-        await self._reply(f"⚠️ git 切换失败，尝试下载版本内容…")
+        await self._reply("⚠️ git 切换失败，尝试下载版本内容…")
         success, msg = await self._do_update(plugin_name, owner, repo, tag_name, token)
         await self._reply(msg)
         return success, msg
@@ -1007,10 +1315,12 @@ class PMCommand(BaseCommand):
             except Exception as e:
                 await self._reply(f"❌ {plugin_name} 热加载异常: {e}")
                 return False, f"reload error: {e}"
-        # 热加载全部（先加载未加载的，再重载已加载的）
+        # 热加载全部（先加载未加载的，再卸载已删除的，最后重载全部）
         # 直接扫描 plugins 目录，找未加载的插件
         plugin_base = Path(plugin_api.get_plugin_path("plugin_manager")).parent
         loaded_set = set(plugin_api.list_loaded_plugins())
+        # Step 1: 扫描磁盘上存在的插件目录
+        disk_plugins = set()
         new_plugins = 0
         newly_loaded = []
         if plugin_base.exists():
@@ -1020,35 +1330,63 @@ class PMCommand(BaseCommand):
                 name = item.name
                 if name.startswith("_") or name.startswith("."):
                     continue
-                if name in loaded_set:
+                if name.endswith(("_old", "_bak")):
+                    continue
+                # 读 manifest.json 获取真实插件名
+                manifest_path = item / "manifest.json"
+                if not manifest_path.exists():
+                    continue
+                try:
+                    import json
+                    with open(manifest_path, "r", encoding="utf-8") as mf:
+                        manifest_data = json.load(mf)
+                    manifest_name = manifest_data.get("name", "")
+                    if not manifest_name:
+                        continue
+                except Exception:
+                    continue
+                disk_plugins.add(manifest_name)
+                if manifest_name in loaded_set:
                     continue
                 # 尝试加载
                 try:
                     ok = await plugin_api.load_plugin(str(item))
                     if ok:
                         new_plugins += 1
-                        newly_loaded.append(name)
+                        newly_loaded.append(manifest_name)
                     else:
-                        # 获取失败原因
                         reason = ""
                         try:
                             unloaded = await plugin_api.list_unloaded_plugins()
-                            if name in unloaded:
-                                reason = unloaded[name].get("reason", "")
+                            if manifest_name in unloaded:
+                                reason = unloaded[manifest_name].get("reason", "")
                         except Exception:
                             pass
-                        msg = f"⚠️ 加载 {name} 失败"
+                        msg = f"⚠️ 加载 {manifest_name} 失败"
                         if reason:
                             msg += f"（{reason}）"
                         await self._reply(msg)
                 except Exception as e:
-                    await self._reply(f"⚠️ 加载 {name} 异常: {e}")
-        # 合并已加载和新加载的
-        loaded = sorted(loaded_set | set(newly_loaded))
+                    await self._reply(f"⚠️ 加载 {manifest_name} 异常: {e}")
+        # Step 2: 卸载已删除的插件（磁盘上没有但 loaded_set 里有的）
+        for name in sorted(loaded_set):
+            if name not in disk_plugins and name != "plugin_manager":
+                try:
+                    ok = await plugin_api.unload_plugin(name)
+                    if ok:
+                        await self._reply(f"🗑️ 已卸载已删除的插件: {name}")
+                    else:
+                        await self._reply(f"⚠️ 卸载 {name} 失败（可能仍在被使用）")
+                except Exception as e:
+                    await self._reply(f"⚠️ 卸载 {name} 异常: {e}")
+        # Step 3: 重载所有（排除已被卸载的）
+        loaded = sorted(disk_plugins)
         if not loaded:
             await self._reply("📭 没有已加载的插件")
             return True, "no plugins"
-        await self._reply(f"🔄 正在热加载 {len(loaded)} 个插件{'（含 ' + str(new_plugins) + ' 个新加载）' if new_plugins else ''}…")
+        await self._reply(
+            f"🔄 正在热加载 {len(loaded)} 个插件{'（含 ' + str(new_plugins) + ' 个新加载）' if new_plugins else ''}…"
+        )
         success_list = []
         fail_list = []
         for name in loaded:
@@ -1144,7 +1482,9 @@ class PMCommand(BaseCommand):
                     await self._reply("❌ 间隔必须 ≥ 1 分钟")
                     return False, "invalid interval"
                 cfg.check_interval_minutes = minutes
-                await self._reply(f"✅ 检查间隔已设为 {minutes} 分钟 ({minutes // 60} 小时)")
+                await self._reply(
+                    f"✅ 检查间隔已设为 {minutes} 分钟 ({minutes // 60} 小时)"
+                )
             except ValueError:
                 await self._reply("❌ 间隔必须是数字（分钟）")
                 return False, "invalid number"
@@ -1174,23 +1514,32 @@ class PMCommand(BaseCommand):
                 "⚙️ 插件管理器配置:",
                 "───" * 10,
                 "# 备份配置",
-                f"[backup]",
+                "[backup]",
                 f"  max_backups_per_plugin = {cfg.backup.max_backups_per_plugin}  # 每个插件最大备份保留数 (int)",
                 f"  backup_dir = {cfg.backup.backup_dir}  # 备份目录名 (str)",
-                f"",
+                "",
                 "# 自动更新配置",
-                f"[auto_update]",
+                "[auto_update]",
                 f"  enabled = {cfg.auto_update.enabled}  # 自动更新总开关 (bool)",
                 f"  check_interval_minutes = {cfg.auto_update.check_interval_minutes}  # 检查间隔，单位分钟 (int)",
-                f"",
+                f"  passive_check = {cfg.auto_update.passive_check}  # 是否被动触发（消息经过时顺带检测）(bool)",
+                f"  passive_cooldown_minutes = {cfg.auto_update.passive_cooldown_minutes}  # 被动触发冷却时间 (int)",
+                f"  extend_eventbus_timeout = {cfg.auto_update.extend_eventbus_timeout}  # 增大EventBus超时（长时间命令不被打断）(bool)",
+                "",
+                "# 市场插件配置",
+                "[market]",
+                f"  check_interval_minutes = {cfg.market.check_interval_minutes}  # 市场订阅缓存有效期（分钟）(int)",
+                f"  default_update_policy = {cfg.market.default_update_policy}  # 市场插件默认更新策略：silent/notify/prompt (str)",
+                "",
                 "# 代理配置",
-                f"[proxy]",
+                "[proxy]",
                 f"  http = {cfg.proxy.http or '(未设置)'}  # HTTP 代理地址 (str)",
                 f"  https = {cfg.proxy.https or '(未设置)'}  # HTTPS 代理地址 (str)",
-                f"",
+                "",
                 "# GitHub 配置",
-                f"[github]",
+                "[github]",
                 f"  token = {'***' if cfg.github.token else '(未设置)'}  # GitHub Token，可选，提高 API 限频 (str)",
+                f"  default_update_policy = {cfg.github.default_update_policy}  # GitHub 插件默认更新策略：silent/notify/prompt (str)",
             ]
             await self._reply("\n".join(lines))
             # 单独发送修改用法说明，避免消息过长被截断
@@ -1215,7 +1564,9 @@ class PMCommand(BaseCommand):
             if args and "=" in args[0]:
                 key, value = args[0].split("=", 1)
             else:
-                await self._reply("❌ 用法: /pm settings <配置项路径> <值>\n  例: /pm settings auto_update.enabled 开启\n  例: /pm settings proxy.http=http://127.0.0.1:7890")
+                await self._reply(
+                    "❌ 用法: /pm settings <配置项路径> <值>\n  例: /pm settings auto_update.enabled 开启\n  例: /pm settings proxy.http=http://127.0.0.1:7890"
+                )
                 return False, "missing args"
         else:
             key = args[0]
@@ -1243,14 +1594,18 @@ class PMCommand(BaseCommand):
                         if reload_ok:
                             await self._reply("♻️ 插件管理器已重载，配置已生效")
                         else:
-                            await self._reply("⚠️ 配置已保存，但重载失败，请手动重启 MoFox")
+                            await self._reply(
+                                "⚠️ 配置已保存，但重载失败，请手动重启 MoFox"
+                            )
                     except Exception as e:
                         await self._reply(f"⚠️ 配置已保存，但重载异常: {e}")
                 else:
                     await self._reply(f"❌ 未知配置项: {key}")
                     return False, "unknown key"
             else:
-                await self._reply("❌ 格式错误，使用 section.field 格式，如 backup.max_backups_per_plugin")
+                await self._reply(
+                    "❌ 格式错误，使用 section.field 格式，如 backup.max_backups_per_plugin"
+                )
                 return False, "invalid key format"
         except ValueError as e:
             await self._reply(f"❌ 类型转换失败: {e}")
@@ -1265,7 +1620,9 @@ class PMCommand(BaseCommand):
         if not await self._ensure_admin():
             return False, "permission denied"
         if not github_url:
-            await self._reply("❌ 用法: /pm install <仓库地址>\n  示例: /pm install https://github.com/用户/仓库名\n  示例: /pm install 用户/仓库名（自动补全）")
+            await self._reply(
+                "❌ 用法: /pm install <仓库地址>\n  示例: /pm install https://github.com/用户/仓库名\n  示例: /pm install 用户/仓库名（自动补全）"
+            )
             return False, "missing url"
         # 自动补全 github.com 前缀
         url = github_url.strip().rstrip("/")
@@ -1286,7 +1643,9 @@ class PMCommand(BaseCommand):
         plugin_base = Path(plugin_api.get_plugin_path("plugin_manager")).parent
         dest_path = plugin_base / repo_name
         if dest_path.exists():
-            await self._reply(f"❌ 插件目录已存在: {dest_path}\n如需重新安装，请先删除旧目录")
+            await self._reply(
+                f"❌ 插件目录已存在: {dest_path}\n如需重新安装，请先删除旧目录"
+            )
             return False, "already exists"
         await self._reply(f"📥 正在从 {url} 克隆插件…")
         # 用异步子进程实现进度提示，并注入代理
@@ -1302,9 +1661,13 @@ class PMCommand(BaseCommand):
                 proxy_http = getattr(cfg.proxy, "http", "") or ""
                 proxy_https = getattr(cfg.proxy, "https", "") or ""
             if not proxy_http:
-                proxy_http = os.environ.get("HTTP_PROXY", "") or os.environ.get("http_proxy", "")
+                proxy_http = os.environ.get("HTTP_PROXY", "") or os.environ.get(
+                    "http_proxy", ""
+                )
             if not proxy_https:
-                proxy_https = os.environ.get("HTTPS_PROXY", "") or os.environ.get("https_proxy", "")
+                proxy_https = os.environ.get("HTTPS_PROXY", "") or os.environ.get(
+                    "https_proxy", ""
+                )
             if not proxy_http:
                 proxy_http = "http://127.0.0.1:7890"  # 默认代理
             if not proxy_https:
@@ -1315,7 +1678,11 @@ class PMCommand(BaseCommand):
             git_env["https_proxy"] = proxy_https
 
             process = await asyncio.create_subprocess_exec(
-                "git", "clone", "--progress", url, str(dest_path),
+                "git",
+                "clone",
+                "--progress",
+                url,
+                str(dest_path),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=git_env,
@@ -1332,7 +1699,9 @@ class PMCommand(BaseCommand):
                 waited += 15
                 if process.returncode is not None:
                     break
-                await self._reply(f"⏳ 正在克隆… 已等待 {waited} 秒（大仓库可能需要数分钟）")
+                await self._reply(
+                    f"⏳ 正在克隆… 已等待 {waited} 秒（大仓库可能需要数分钟）"
+                )
 
         ticker_task = asyncio.create_task(_progress_ticker())
         try:
@@ -1345,16 +1714,21 @@ class PMCommand(BaseCommand):
             # 清理残留目录
             if dest_path.exists():
                 import shutil
+
                 shutil.rmtree(dest_path, ignore_errors=True)
-            await self._reply("⏱️ 克隆超时（超过 3 分钟）\n"
-                              "可能原因：仓库地址错误、网络不通或 DNS 解析失败\n"
-                              "建议：确认地址后重试")
+            await self._reply(
+                "⏱️ 克隆超时（超过 3 分钟）\n"
+                "可能原因：仓库地址错误、网络不通或 DNS 解析失败\n"
+                "建议：确认地址后重试"
+            )
             return False, "clone timeout"
         finally:
             ticker_task.cancel()
 
         if process.returncode != 0:
-            error_msg = (stderr_bytes.decode() if stderr_bytes else "").strip() or "未知错误"
+            error_msg = (
+                stderr_bytes.decode() if stderr_bytes else ""
+            ).strip() or "未知错误"
             # 截取过长错误信息
             if len(error_msg) > 500:
                 error_msg = error_msg[:500] + "…"
@@ -1362,6 +1736,7 @@ class PMCommand(BaseCommand):
             # 清理残留目录
             if dest_path.exists():
                 import shutil
+
                 shutil.rmtree(dest_path, ignore_errors=True)
             return False, f"clone failed: {error_msg}"
         # 验证克隆结果：检查目录下是否有插件文件
@@ -1375,6 +1750,7 @@ class PMCommand(BaseCommand):
             # 清理空目录
             if dest_path.exists():
                 import shutil
+
                 shutil.rmtree(dest_path, ignore_errors=True)
             await self._reply("❌ 克隆失败：仓库为空或不存在，请检查仓库地址")
             return False, "empty clone"

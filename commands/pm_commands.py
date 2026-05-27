@@ -205,36 +205,39 @@ class PMCommand(BaseCommand):
                 return loaded[idx]
         return name_or_index
 
-    def _get_github_repo(self, plugin_name: str) -> str:
+    async def _get_github_repo(self, plugin_name: str) -> str:
         """获取插件的 GitHub 仓库地址。
-        优先级：manifest.json 中的 repo 字段 > git remote
+        优先级：manifest.json 中的 repo 字段 > git remote（异步）
         """
         # 1. 从 manifest.json 读取
         repo = self._get_manifest_field(plugin_name, "repo")
         if repo:
             return repo
-        # 2. 从 git remote 获取
+        # 2. 从 git remote 获取（异步）
         path = plugin_api.get_plugin_path(plugin_name)
         if not path:
             return ""
         try:
-            import subprocess
-
-            result = subprocess.run(
-                ["git", "-C", path, "remote", "get-url", "origin"],
-                capture_output=True,
-                text=True,
-                timeout=5,
+            proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "remote", "get-url", "origin",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode == 0:
-                url = result.stdout.strip()
+            try:
+                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                return ""
+            if proc.returncode == 0:
+                url = stdout.decode().strip()
                 # 转换 SSH 格式为 HTTPS
                 if url.startswith("git@"):
                     url = url.replace(":", "/").replace("git@", "https://")
                 if url.endswith(".git"):
                     url = url[:-4]
                 return url
-        except (FileNotFoundError, subprocess.TimeoutExpired):
+        except FileNotFoundError:
             pass
         return ""
 
@@ -322,11 +325,15 @@ class PMCommand(BaseCommand):
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         zip_path = backup_dir / f"{timestamp}.zip"
         try:
-            # 压缩整个插件目录
-            shutil.make_archive(
-                str(zip_path.with_suffix("")),
-                "zip",
-                root_dir=path,
+            # 压缩整个插件目录（丢到线程池避免阻塞事件循环）
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                lambda: shutil.make_archive(
+                    str(zip_path.with_suffix("")),
+                    "zip",
+                    root_dir=path,
+                ),
             )
             logger.info(f"已备份 {plugin_name} → {zip_path}")
             # 清理旧备份
@@ -388,7 +395,7 @@ class PMCommand(BaseCommand):
         except OSError as e:
             logger.error(f"保存插件设置失败: {e}")
 
-    def _get_plugin_source_info(self, plugin_name: str) -> dict[str, Any]:
+    async def _get_plugin_source_info(self, plugin_name: str) -> dict[str, Any]:
         """获取插件的来源和策略配置。从 settings 读取，无配置时自动推断。"""
         settings = self._load_plugin_settings()
         plugins_config = settings.get("plugins", {})
@@ -396,7 +403,7 @@ class PMCommand(BaseCommand):
         if info:
             return info
         # 自动推断：有 GitHub repo 则为 github，否则为 unknown
-        repo_url = self._get_github_repo(plugin_name)
+        repo_url = await self._get_github_repo(plugin_name)
         is_mfp = False
         path = plugin_api.get_plugin_path(plugin_name)
         if path:
@@ -439,12 +446,12 @@ class PMCommand(BaseCommand):
 
     def _get_plugin_setting(self, plugin_name: str, key: str, default: Any = None) -> Any:
         """获取插件单项配置。"""
-        info = self._get_plugin_source_info(plugin_name)
+        info = await self._get_plugin_source_info(plugin_name)
         return info.get(key, default)
 
     def _set_plugin_setting(self, plugin_name: str, key: str, value: Any) -> None:
         """设置插件单项配置。"""
-        info = self._get_plugin_source_info(plugin_name)
+        info = await self._get_plugin_source_info(plugin_name)
         info[key] = value
         self._set_plugin_source_info(plugin_name, info)
 
@@ -547,7 +554,7 @@ class PMCommand(BaseCommand):
         # 2. 遍历插件
         for name in loaded:
             try:
-                source_info = self._get_plugin_source_info(name)
+                source_info = await self._get_plugin_source_info(name)
                 source = source_info.get("source", "unknown")
                 if source == "unknown":
                     continue
@@ -746,7 +753,7 @@ class PMCommand(BaseCommand):
                 if ok:
                     logger.info(f"市场插件 {name} 已加载")
                     # 自动注册 auto_update
-                    source_info = self._get_plugin_source_info(name)
+                    source_info = await self._get_plugin_source_info(name)
                     if not source_info.get("auto_update", False):
                         source_info["auto_update"] = True
                         source_info["source"] = "market"
@@ -815,7 +822,7 @@ class PMCommand(BaseCommand):
 
     async def _check_github_version(self, name: str, config: Any) -> str:
         """检查 GitHub 插件最新版本。返回版本号或空字符串。"""
-        repo_url = self._get_github_repo(name)
+        repo_url = await self._get_github_repo(name)
         if not repo_url:
             return ""
         parsed = self._parse_github_repo(repo_url)
@@ -843,7 +850,7 @@ class PMCommand(BaseCommand):
 
     async def _do_silent_update(self, name: str, version: str, config: Any) -> None:
         """静默自动更新——不通知用户。"""
-        source_info = self._get_plugin_source_info(name)
+        source_info = await self._get_plugin_source_info(name)
         source = source_info.get("source", "unknown")
         if source == "market":
             success, msg = await self._do_market_update(name, version, config)
@@ -851,7 +858,7 @@ class PMCommand(BaseCommand):
                 logger.info(f"静默更新 {name} → {version} 成功")
                 self._update_cached_version(name, version)
             return
-        repo_url = self._get_github_repo(name)
+        repo_url = await self._get_github_repo(name)
         if repo_url:
             parsed = self._parse_github_repo(repo_url)
             if parsed:
@@ -865,7 +872,7 @@ class PMCommand(BaseCommand):
     async def _do_notify_update(self, name: str, old_ver: str, new_ver: str, config: Any) -> None:
         """通知式自动更新——先通知，再更新，完成后通知。"""
         await self._send_notification(f"🔄 {name} 检测到更新 {old_ver} → {new_ver}，正在自动更新…")
-        source_info = self._get_plugin_source_info(name)
+        source_info = await self._get_plugin_source_info(name)
         source = source_info.get("source", "unknown")
         if source == "market":
             success, msg = await self._do_market_update(name, new_ver, config)
@@ -875,7 +882,7 @@ class PMCommand(BaseCommand):
             else:
                 await self._send_notification(f"❌ {name} 自动更新失败: {msg}")
             return
-        repo_url = self._get_github_repo(name)
+        repo_url = await self._get_github_repo(name)
         if repo_url:
             parsed = self._parse_github_repo(repo_url)
             if parsed:
@@ -1106,7 +1113,7 @@ class PMCommand(BaseCommand):
             version = getattr(instance, "plugin_version", "?") if instance else "?"
             desc = getattr(instance, "plugin_description", "") if instance else ""
             short_desc = f" — {desc[:40]}" if desc else ""
-            has_repo = bool(self._get_github_repo(name))
+            has_repo = bool(await self._get_github_repo(name))
             no_repo_mark = "" if has_repo else " ⛔不可自动更新"
             auto_mark = " 🔄" if auto_update_map.get(name, False) else ""
             lines.append(
@@ -1152,11 +1159,11 @@ class PMCommand(BaseCommand):
         market_plugins: list[str] = []
         to_check: list[tuple[str, str, str]] = []  # (name, owner, repo)
         for name in plugins_to_check:
-            source_info = self._get_plugin_source_info(name)
+            source_info = await self._get_plugin_source_info(name)
             if source_info.get("source") == "market":
                 market_plugins.append(name)
                 continue
-            repo_url = self._get_github_repo(name)
+            repo_url = await self._get_github_repo(name)
             if not repo_url:
                 no_repo.append(name)
                 continue
@@ -1282,7 +1289,7 @@ class PMCommand(BaseCommand):
             return False, "plugin not found"
 
         config = self._get_config()
-        source_info = self._get_plugin_source_info(plugin_name)
+        source_info = await self._get_plugin_source_info(plugin_name)
         source = source_info.get("source", "unknown")
 
         if source == "market":
@@ -1303,7 +1310,7 @@ class PMCommand(BaseCommand):
             return success, msg
 
         # GitHub 插件更新
-        repo_url = self._get_github_repo(plugin_name)
+        repo_url = await self._get_github_repo(plugin_name)
         if not repo_url:
             await self._reply(f"❌ {plugin_name} 无 GitHub 仓库信息，无法更新")
             return False, "no repo info"
@@ -1347,7 +1354,7 @@ class PMCommand(BaseCommand):
         subs = market_cache.get("subscriptions", [])
         results = []
         for name in loaded:
-            source_info = self._get_plugin_source_info(name)
+            source_info = await self._get_plugin_source_info(name)
             source = source_info.get("source", "unknown")
             if source == "market":
                 # 市场插件
@@ -1367,7 +1374,7 @@ class PMCommand(BaseCommand):
                 results.append(msg)
                 continue
             # GitHub 插件
-            repo_url = self._get_github_repo(name)
+            repo_url = await self._get_github_repo(name)
             if not repo_url:
                 results.append(f"⏭️ {name}: 无仓库信息")
                 continue
@@ -1538,7 +1545,7 @@ class PMCommand(BaseCommand):
         if not path:
             await self._reply(f"❌ 插件 {plugin_name} 不存在或未加载")
             return False, "not found"
-        repo_url = self._get_github_repo(plugin_name)
+        repo_url = await self._get_github_repo(plugin_name)
         if not repo_url:
             await self._reply(f"❌ {plugin_name} 无 GitHub 仓库信息")
             return False, "no repo"
@@ -1579,7 +1586,7 @@ class PMCommand(BaseCommand):
         if not path:
             await self._reply(f"❌ 插件 {plugin_name} 不存在")
             return False, "not found"
-        repo_url = self._get_github_repo(plugin_name)
+        repo_url = await self._get_github_repo(plugin_name)
         if not repo_url:
             await self._reply("❌ 无仓库信息")
             return False, "no repo"
@@ -1610,20 +1617,34 @@ class PMCommand(BaseCommand):
             return False, "no branch name"
         # 自动备份
         await self._create_backup(plugin_name)
-        # 尝试用 git 切换
+        # 尝试用 git 切换（异步）
         try:
-            import subprocess
+            # git fetch --all
+            fetch_proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "fetch", "--all",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                await asyncio.wait_for(fetch_proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                fetch_proc.kill()
+                await fetch_proc.wait()
 
-            subprocess.run(
-                ["git", "-C", path, "fetch", "--all"], capture_output=True, timeout=15
+            # git checkout branch_name
+            co_proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "checkout", branch_name,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            result = subprocess.run(
-                ["git", "-C", path, "checkout", branch_name],
-                capture_output=True,
-                text=True,
-                timeout=15,
-            )
-            if result.returncode != 0:
+            try:
+                stdout, _ = await asyncio.wait_for(co_proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                co_proc.kill()
+                await co_proc.wait()
+                stdout = b""
+
+            if co_proc.returncode != 0:
                 # git 方式失败，尝试下载
                 await self._reply("⚠️ git checkout 失败，尝试下载分支内容…")
                 success, msg = await self._do_update(
@@ -1655,7 +1676,7 @@ class PMCommand(BaseCommand):
         if not path:
             await self._reply(f"❌ 插件 {plugin_name} 不存在或未加载")
             return False, "not found"
-        repo_url = self._get_github_repo(plugin_name)
+        repo_url = await self._get_github_repo(plugin_name)
         if not repo_url:
             await self._reply(f"❌ {plugin_name} 无 GitHub 仓库信息")
             return False, "no repo"
@@ -1709,7 +1730,7 @@ class PMCommand(BaseCommand):
         if not path:
             await self._reply(f"❌ 插件 {plugin_name} 不存在")
             return False, "not found"
-        repo_url = self._get_github_repo(plugin_name)
+        repo_url = await self._get_github_repo(plugin_name)
         if not repo_url:
             await self._reply("❌ 无仓库信息")
             return False, "no repo"
@@ -1744,17 +1765,20 @@ class PMCommand(BaseCommand):
             return False, "no tag name"
         # 自动备份
         await self._create_backup(plugin_name)
-        # 尝试用 git 切换
+        # 尝试用 git 切换（异步）
         try:
-            import subprocess
-
-            result = subprocess.run(
-                ["git", "-C", path, "checkout", "tags/" + tag_name],
-                capture_output=True,
-                text=True,
-                timeout=15,
+            co_proc = await asyncio.create_subprocess_exec(
+                "git", "-C", path, "checkout", f"tags/{tag_name}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
-            if result.returncode == 0:
+            try:
+                await asyncio.wait_for(co_proc.communicate(), timeout=15)
+            except asyncio.TimeoutError:
+                co_proc.kill()
+                await co_proc.wait()
+
+            if co_proc.returncode == 0:
                 success = await plugin_api.reload_plugin(plugin_name)
                 status = "（已热加载）" if success else "（热加载失败，请手动重启）"
                 await self._reply(f"✅ {plugin_name} 已切换到 {tag_name}{status}")

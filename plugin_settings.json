@@ -1,0 +1,17 @@
+{
+  "market_cache": {
+    "subscriptions": [
+      {
+        "plugin_id": "plugin_manager",
+        "name": "plugin_manager",
+        "latest_version": "1.2.0"
+      },
+      {
+        "plugin_id": "send_to",
+        "name": "send_to",
+        "latest_version": "3.0.0"
+      }
+    ],
+    "fetched_at": 1779839983.428266
+  }
+}
